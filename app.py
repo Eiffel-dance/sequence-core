@@ -134,6 +134,13 @@ class TanhSequence:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
 
+        # Snapshot every piece of state a traversal can touch. State is only
+        # committed once all rows succeed, so any failure restores the exact
+        # pre-call state (atomic commit).
+        saved_hidden = self.hidden
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+
         inputs = []
         prev_hiddens = []
         outputs = []
@@ -142,18 +149,31 @@ class TanhSequence:
         # must not affect backward() of the recorded pass.
         weights = list(self.linear.weight)
 
-        self.hidden = 0.0
-        for i, row in enumerate(rows):
-            if truncate is not None and i % truncate == 0:
-                # Segment start: hidden state is reset to zero.
-                self.hidden = 0.0
-                boundaries.add(i)
-            x = _read_row(row)
-            prev_hiddens.append(self.hidden)
-            self.hidden = math.tanh(self.linear.forward([x, self.hidden]))
-            inputs.append(x)
-            outputs.append(self.hidden)
+        # The first segment always starts from a zero hidden state; work on a
+        # local so self.hidden is not modified until the traversal succeeds.
+        hidden = 0.0
+        try:
+            for i, row in enumerate(rows):
+                if truncate is not None and i % truncate == 0:
+                    # Segment start: hidden state is reset to zero.
+                    hidden = 0.0
+                    boundaries.add(i)
+                x = _read_row(row)
+                prev_hiddens.append(hidden)
+                hidden = math.tanh(self.linear.forward([x, hidden]))
+                inputs.append(x)
+                outputs.append(hidden)
+        except (TypeError, ValueError):
+            # Roll back partial progress: the current hidden state and the
+            # Linear layer's most recent forward record. Parameter gradients
+            # are never touched by a forward pass, and outputs/_fwd are only
+            # committed below.
+            self.hidden = saved_hidden
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            raise
 
+        self.hidden = hidden
         self.outputs = outputs
         # Cache of this forward pass for backward(). Only committed once the
         # whole traversal succeeded, so an illegal row leaves any earlier
