@@ -242,6 +242,18 @@ class TanhSequence:
         return self.outputs
 
     def backward(self, grad_outputs):
+        # Terminal hidden-state gradient is zero, so this is exactly the
+        # previously recorded behavior: only the per-input gradient list is
+        # returned (parameter gradients are accumulated on the Linear).
+        return self._backward(grad_outputs, 0.0, return_initial=False)
+
+    def backward_with_initial_hidden(self, grad_outputs, grad_hidden=0.0):
+        # Like backward(), but additionally treats grad_hidden as the upstream
+        # gradient of the cached forward's final hidden state and returns the
+        # gradient with respect to that forward's initial_hidden as well.
+        return self._backward(grad_outputs, grad_hidden, return_initial=True)
+
+    def _backward(self, grad_outputs, grad_hidden, return_initial):
         if self._fwd is None:
             raise RuntimeError("backward requires a cached forward pass; call forward first")
 
@@ -252,31 +264,50 @@ class TanhSequence:
         w_input = self._fwd["weights"][0]
         w_hidden = self._fwd["weights"][1]
         n = len(outputs)
+        # Validate every argument before any gradient is accumulated, so a
+        # rejected call leaves both the cache and the Linear's accumulated
+        # gradients exactly as they were.
         grad_outputs = _read_grad_list(grad_outputs, n)
+        grad_hidden = _read_number(grad_hidden, "grad_hidden")
 
         input_grads = [0.0] * n
 
-        # Hidden-state gradient propagated from step t + 1 back into step t.
-        hidden_grad = 0.0
+        # The terminal hidden-state gradient seeds the recurrence at the last
+        # step, where it is added to that step's output gradient. A zero seed
+        # reproduces backward() bit for bit.
+        hidden_grad = float(grad_hidden)
+        # An empty cached sequence has no steps: return the terminal gradient
+        # unchanged (as provided) without touching any parameter gradient.
+        grad_initial_hidden = grad_hidden if n == 0 else 0.0
         for t in range(n - 1, -1, -1):
-            # Gradient from later steps *within this segment* still flows
-            # into the segment-start step itself.
+            # Gradient from later steps *within this segment* (including the
+            # terminal hidden-state gradient at the final step) still flows
+            # into the current step together with its own output gradient.
             dh = grad_outputs[t] + hidden_grad
             d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
 
             # Parameter gradients at this step are always accumulated,
-            # including at segment starts (the hidden-state term is zero
-            # there because the start hidden is reset to zero).
+            # including at segment starts (the detached carry value is treated
+            # as a constant and enters this local derivative only).
             self.linear.grad[0] += d_pre * inputs[t]
             self.linear.grad[1] += d_pre * prev_hiddens[t]
             self.linear.grad_bias += d_pre
 
             input_grads[t] = d_pre * w_input
+            # Step 0 always consumes initial_hidden as its previous hidden
+            # state. With truncation the boundary cut below severs later
+            # segments, so this local term is the full gradient with respect
+            # to initial_hidden; without truncation it is reached uncut.
+            if t == 0:
+                grad_initial_hidden = d_pre * w_hidden
             if t in boundaries:
-                # Truncated BPTT: this step consumed a hidden state forced to
-                # zero, so no gradient crosses back into the prior segment.
+                # Truncated BPTT: segment-start hidden values (zeroed or
+                # carried as detached numbers) are constants, so no gradient
+                # crosses back into the prior segment.
                 hidden_grad = 0.0
             else:
                 hidden_grad = d_pre * w_hidden
 
+        if return_initial:
+            return input_grads, grad_initial_hidden
         return input_grads
