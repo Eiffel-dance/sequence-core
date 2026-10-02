@@ -242,6 +242,17 @@ class TanhSequence:
         return self.outputs
 
     def backward(self, grad_outputs):
+        # Original single-return contract: a zero terminal-hidden gradient is
+        # exactly the old loss, so delegate to the full interface and return
+        # only the per-input gradients. Both the input gradients and the
+        # accumulated parameter gradients are therefore identical to the
+        # dedicated interface called with grad_hidden=0.0.
+        input_grads, _grad_initial_hidden = self.backward_with_initial_hidden(
+            grad_outputs, 0.0
+        )
+        return input_grads
+
+    def backward_with_initial_hidden(self, grad_outputs, grad_hidden=0.0):
         if self._fwd is None:
             raise RuntimeError("backward requires a cached forward pass; call forward first")
 
@@ -252,31 +263,53 @@ class TanhSequence:
         w_input = self._fwd["weights"][0]
         w_hidden = self._fwd["weights"][1]
         n = len(outputs)
+
+        # Validate every gradient argument before any accumulation, so a
+        # rejected call leaves the cached forward pass and Linear.grad /
+        # grad_bias exactly as they were.
         grad_outputs = _read_grad_list(grad_outputs, n)
+        grad_hidden = _read_number(grad_hidden, "grad_hidden")
 
         input_grads = [0.0] * n
+        # With an empty sequence the terminal hidden state is initial_hidden
+        # itself, so its upstream gradient passes through unchanged and no
+        # parameter gradients are touched.
+        grad_initial_hidden = grad_hidden if n == 0 else 0.0
 
         # Hidden-state gradient propagated from step t + 1 back into step t.
         hidden_grad = 0.0
         for t in range(n - 1, -1, -1):
             # Gradient from later steps *within this segment* still flows
-            # into the segment-start step itself.
+            # into the segment-start step itself. The terminal hidden state
+            # is the last output node, so the terminal-loss gradient enters
+            # only at that final step.
             dh = grad_outputs[t] + hidden_grad
+            if t == n - 1:
+                dh += grad_hidden
             d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
 
             # Parameter gradients at this step are always accumulated,
-            # including at segment starts (the hidden-state term is zero
-            # there because the start hidden is reset to zero).
+            # including at segment starts (the hidden-state input there is a
+            # reset zero or a detached carried value, which only zeroes the
+            # path back into earlier segments, not this local product).
             self.linear.grad[0] += d_pre * inputs[t]
             self.linear.grad[1] += d_pre * prev_hiddens[t]
             self.linear.grad_bias += d_pre
 
             input_grads[t] = d_pre * w_input
+            if t == 0:
+                # prev_hiddens[0] is always this forward's initial_hidden:
+                # the first segment starts there even under truncation, so
+                # the gradient crossing into it is reported separately.
+                # Later segment starts are detached constants and never reach
+                # this branch, so no gradient leaks into earlier segments.
+                grad_initial_hidden = d_pre * w_hidden
             if t in boundaries:
-                # Truncated BPTT: this step consumed a hidden state forced to
-                # zero, so no gradient crosses back into the prior segment.
+                # Truncated BPTT: this step consumed a hidden state treated
+                # as a constant (forced to zero, or carried in detached), so
+                # no gradient crosses back into the prior segment.
                 hidden_grad = 0.0
             else:
                 hidden_grad = d_pre * w_hidden
 
-        return input_grads
+        return input_grads, grad_initial_hidden
