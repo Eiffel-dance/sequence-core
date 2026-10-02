@@ -129,10 +129,15 @@ class TanhSequence:
         self._fwd = None
         return self.hidden
 
-    def forward(self, rows, truncate=None):
+    def forward(self, rows, truncate=None, carry_hidden=False):
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
+        # Only an actual boolean is accepted (bool is a subclass of int, so an
+        # explicit isinstance check is required). Validated before any state,
+        # cache, or Linear forward record is touched.
+        if not isinstance(carry_hidden, bool):
+            raise ValueError("carry_hidden must be a boolean")
 
         # Snapshot every piece of observable state the traversal may touch so
         # that any failure rolls the sequence back to its pre-call state: a
@@ -161,8 +166,16 @@ class TanhSequence:
         try:
             for i, row in enumerate(rows):
                 if truncate is not None and i % truncate == 0:
-                    # Segment start: hidden state is reset to zero.
-                    hidden = 0.0
+                    # Segment start. Without carry the hidden state is reset
+                    # to zero; with carry the first segment starts from zero
+                    # and every later segment starts from the previous
+                    # segment's last hidden value. The value is detached from
+                    # the autograd graph: it enters the local derivatives of
+                    # this segment's first step but no gradient crosses back.
+                    if i > 0 and carry_hidden:
+                        hidden = outputs[-1]
+                    else:
+                        hidden = 0.0
                     boundaries.add(i)
                 x = _read_row(row)
                 prev_hiddens.append(hidden)
@@ -190,6 +203,7 @@ class TanhSequence:
             "outputs": outputs,
             "boundaries": boundaries,
             "truncate": truncate,
+            "carry_hidden": carry_hidden,
             "weights": weights,
         }
         return self.outputs
