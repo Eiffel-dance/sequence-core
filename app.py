@@ -129,7 +129,9 @@ class TanhSequence:
         self._fwd = None
         return self.hidden
 
-    def forward(self, rows, truncate=None):
+    def forward(self, rows, truncate=None, carry_hidden=False):
+        if not isinstance(carry_hidden, bool):
+            raise ValueError("carry_hidden must be a bool")
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
@@ -161,8 +163,15 @@ class TanhSequence:
         try:
             for i, row in enumerate(rows):
                 if truncate is not None and i % truncate == 0:
-                    # Segment start: hidden state is reset to zero.
-                    hidden = 0.0
+                    # Segment start. By default the hidden state is reset to
+                    # zero. With carry_hidden, later segments instead start
+                    # from the numerical hidden state of the previous
+                    # segment's last step (carried as a detached value: the
+                    # boundary recorded below still blocks gradient flow in
+                    # backward()). The very first segment always starts from
+                    # zero.
+                    if not (carry_hidden and i > 0):
+                        hidden = 0.0
                     boundaries.add(i)
                 x = _read_row(row)
                 prev_hiddens.append(hidden)
@@ -190,6 +199,7 @@ class TanhSequence:
             "outputs": outputs,
             "boundaries": boundaries,
             "truncate": truncate,
+            "carry_hidden": carry_hidden,
             "weights": weights,
         }
         return self.outputs
@@ -218,16 +228,20 @@ class TanhSequence:
             d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
 
             # Parameter gradients at this step are always accumulated,
-            # including at segment starts (the hidden-state term is zero
-            # there because the start hidden is reset to zero).
+            # including at segment starts. The hidden-state term uses the
+            # previous hidden value the forward pass actually consumed: zero
+            # for a reset segment start, or the carried (detached) value when
+            # the recorded pass ran with carry_hidden=True.
             self.linear.grad[0] += d_pre * inputs[t]
             self.linear.grad[1] += d_pre * prev_hiddens[t]
             self.linear.grad_bias += d_pre
 
             input_grads[t] = d_pre * w_input
             if t in boundaries:
-                # Truncated BPTT: this step consumed a hidden state forced to
-                # zero, so no gradient crosses back into the prior segment.
+                # Truncated BPTT: this step's previous hidden state is
+                # treated as a constant (forced to zero, or carried over
+                # detached under carry_hidden), so no gradient crosses back
+                # into the prior segment.
                 hidden_grad = 0.0
             else:
                 hidden_grad = d_pre * w_hidden
