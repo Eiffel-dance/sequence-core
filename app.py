@@ -113,6 +113,15 @@ class Linear:
 
 class TanhSequence:
     def __init__(self, linear):
+        # Only a Linear with exactly two weights (input + hidden) can drive
+        # the recurrence. Rejected dimensions raise immediately; the passed
+        # Linear's parameters and gradient state are never touched here.
+        try:
+            n_weights = len(linear.weight)
+        except (AttributeError, TypeError):
+            raise ValueError("TanhSequence requires a Linear with exactly two weights")
+        if n_weights != 2:
+            raise ValueError("TanhSequence requires a Linear with exactly two weights")
         self.linear = linear
         self.hidden = 0.0
         self.outputs = []
@@ -120,14 +129,20 @@ class TanhSequence:
 
     def reset(self):
         self.hidden = 0.0
+        self.outputs = []
         self._fwd = None
 
     def step(self, row):
         x = _read_row(row)
-        self.hidden = math.tanh(self.linear.forward([x, self.hidden]))
+        new_hidden = math.tanh(self.linear.forward([x, self.hidden]))
+        # Commit only after the computation succeeded: a rejected row leaves
+        # hidden, outputs, the Linear forward record, and any still-usable
+        # cached batch forward pass untouched.
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
         # Stepping invalidates any cached forward pass.
         self._fwd = None
-        return self.hidden
+        return new_hidden
 
     def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
         if truncate is not None:
