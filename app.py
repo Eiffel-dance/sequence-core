@@ -1,4 +1,31 @@
 import math
+from collections.abc import Sequence
+
+
+def _read_number(value, what):
+    """Validate a scalar argument; bool is not accepted as a number."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("%s must be a Python int or float" % what)
+    return value
+
+
+def _read_number_sequence(values, expected_length, what):
+    """Validate a non-text, non-bytes sequence of int/float values."""
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise ValueError("%s must be a non-text, non-bytes sequence of numbers" % what)
+    if not isinstance(values, Sequence):
+        raise ValueError("%s must be a sequence of numbers" % what)
+    if expected_length is not None and len(values) != expected_length:
+        raise ValueError(
+            "%s length %d does not match weight length %d"
+            % (what, len(values), expected_length)
+        )
+    result = []
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("each element of %s must be an int or float" % what)
+        result.append(value)
+    return result
 
 
 def _read_row(row):
@@ -40,16 +67,25 @@ def _read_grad_list(values, expected_length):
 
 class Linear:
     def __init__(self, weight, bias=0.0):
-        self.weight = list(weight)
+        weights = _read_number_sequence(weight, None, "weight")
+        _read_number(bias, "bias")
+        self.weight = weights
         self.bias = bias
         self.grad = [0.0] * len(self.weight)
         self.grad_bias = 0.0
+        self.last = None
 
     def forward(self, x):
-        self.last = x
-        return sum(w * a for w, a in zip(self.weight, x)) + self.bias
+        values = _read_number_sequence(x, len(self.weight), "x")
+        result = sum(w * a for w, a in zip(self.weight, values)) + self.bias
+        # Cache only after validation and computation succeed.
+        self.last = values
+        return result
 
     def backward(self, grad):
+        if self.last is None:
+            raise RuntimeError("backward requires a successful forward call first")
+        _read_number(grad, "grad")
         # Gradients are accumulated item by item across repeated calls.
         self.grad = [g + grad * a for g, a in zip(self.grad, self.last)]
         self.grad_bias += grad
@@ -60,9 +96,11 @@ class Linear:
         self.grad_bias = 0.0
 
     def apply_gradients(self, learning_rate):
-        for j in range(len(self.weight)):
-            self.weight[j] = self.weight[j] - learning_rate * self.grad[j]
-        self.bias = self.bias - learning_rate * self.grad_bias
+        _read_number(learning_rate, "learning_rate")
+        new_weight = [w - learning_rate * g for w, g in zip(self.weight, self.grad)]
+        new_bias = self.bias - learning_rate * self.grad_bias
+        self.weight = new_weight
+        self.bias = new_bias
 
 
 class TanhSequence:
