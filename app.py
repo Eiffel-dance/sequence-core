@@ -113,6 +113,14 @@ class Linear:
 
 class TanhSequence:
     def __init__(self, linear):
+        # Only a Linear with exactly two weights (one input weight, one
+        # recurrent weight) is supported. Rejected immediately, without
+        # touching the passed layer's parameters, gradients, or last-forward
+        # record.
+        if not isinstance(linear, Linear):
+            raise ValueError("TanhSequence requires a Linear with exactly two weights")
+        if len(linear.weight) != 2:
+            raise ValueError("TanhSequence requires a Linear with exactly two weights")
         self.linear = linear
         self.hidden = 0.0
         self.outputs = []
@@ -120,14 +128,26 @@ class TanhSequence:
 
     def reset(self):
         self.hidden = 0.0
+        self.outputs = []
+        # Resetting invalidates any cached sequence forward pass, but leaves
+        # the wrapped Linear's parameters, accumulated gradients, and its own
+        # last-forward record completely untouched.
         self._fwd = None
 
     def step(self, row):
+        # Validate before any state is touched, so a rejected row changes
+        # neither hidden/outputs nor the Linear's last-forward record, and a
+        # batch forward cache stays available for backward().
         x = _read_row(row)
-        self.hidden = math.tanh(self.linear.forward([x, self.hidden]))
-        # Stepping invalidates any cached forward pass.
+        # Compute into a local first; only commit once the Linear forward and
+        # the tanh succeeded.
+        new_hidden = math.tanh(self.linear.forward([x, self.hidden]))
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
+        # Continuing the trajectory stepwise mixes it with any recorded batch
+        # pass, so that cache can no longer be back-propagated safely.
         self._fwd = None
-        return self.hidden
+        return new_hidden
 
     def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
         if truncate is not None:
