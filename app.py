@@ -129,7 +129,7 @@ class TanhSequence:
         self._fwd = None
         return self.hidden
 
-    def forward(self, rows, truncate=None, carry_hidden=False):
+    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
@@ -138,6 +138,15 @@ class TanhSequence:
         # cache, or Linear forward record is touched.
         if not isinstance(carry_hidden, bool):
             raise ValueError("carry_hidden must be a boolean")
+        # Optional external starting hidden state for this call. Omitted
+        # (None) keeps the existing rule of starting from 0.0. Validated with
+        # the same scalar rules as every other numeric argument, before any
+        # state, cache, or Linear forward record is touched, so a rejected
+        # value changes nothing.
+        if initial_hidden is None:
+            initial_hidden = 0.0
+        else:
+            initial_hidden = _read_number(initial_hidden, "initial_hidden")
 
         # Snapshot every piece of observable state the traversal may touch so
         # that any failure rolls the sequence back to its pre-call state: a
@@ -161,21 +170,25 @@ class TanhSequence:
         weights = list(self.linear.weight)
 
         # The traversal works on locals only; self.* is committed solely on
-        # full success below.
-        hidden = 0.0
+        # full success below. An empty rows sequence therefore commits
+        # initial_hidden as the current hidden state with empty outputs.
+        hidden = initial_hidden
         try:
             for i, row in enumerate(rows):
                 if truncate is not None and i % truncate == 0:
-                    # Segment start. Without carry the hidden state is reset
-                    # to zero; with carry the first segment starts from zero
-                    # and every later segment starts from the previous
-                    # segment's last hidden value. The value is detached from
-                    # the autograd graph: it enters the local derivatives of
-                    # this segment's first step but no gradient crosses back.
+                    # Segment start. The very first segment starts from
+                    # initial_hidden; without carry every later segment is
+                    # reset to zero; with carry every later segment starts
+                    # from a numeric copy of the previous segment's last
+                    # hidden value. The value is detached from the autograd
+                    # graph: it enters the local derivatives of this
+                    # segment's first step but no gradient crosses back.
                     if i > 0 and carry_hidden:
                         hidden = outputs[-1]
-                    else:
+                    elif i > 0:
                         hidden = 0.0
+                    else:
+                        hidden = initial_hidden
                     boundaries.add(i)
                 x = _read_row(row)
                 prev_hiddens.append(hidden)
