@@ -1,4 +1,29 @@
 import math
+from collections.abc import Sequence
+
+
+_TEXT_BYTES = (str, bytes, bytearray, memoryview)
+
+
+def _is_number(value):
+    """Return True only for plain Python int or float (bool is rejected)."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _read_numeric_sequence(values, what):
+    """Validate a non-text, non-bytes sequence of int/float values.
+
+    Returns a fresh list preserving the incoming order. Raises ValueError
+    for text, byte-like values, non-sequences, or illegal elements.
+    """
+    if isinstance(values, _TEXT_BYTES) or not isinstance(values, Sequence):
+        raise ValueError("%s must be a non-text sequence of numbers" % what)
+    result = []
+    for value in values:
+        if not _is_number(value):
+            raise ValueError("each %s value must be an int or float" % what)
+        result.append(value)
+    return result
 
 
 def _read_row(row):
@@ -40,18 +65,39 @@ def _read_grad_list(values, expected_length):
 
 class Linear:
     def __init__(self, weight, bias=0.0):
-        self.weight = list(weight)
+        # Validate completely before any attribute is bound, so a rejected
+        # construction never leaves a partially initialized layer behind.
+        checked_weight = _read_numeric_sequence(weight, "weight")
+        if not _is_number(bias):
+            raise ValueError("bias must be an int or float")
+        self.weight = checked_weight
         self.bias = bias
         self.grad = [0.0] * len(self.weight)
         self.grad_bias = 0.0
+        self._last = None
 
     def forward(self, x):
-        self.last = x
-        return sum(w * a for w, a in zip(self.weight, x)) + self.bias
+        # Fully validate first: a failed call must not touch the cache.
+        values = _read_numeric_sequence(x, "input")
+        if len(values) != len(self.weight):
+            raise ValueError(
+                "input length %d does not match weight length %d"
+                % (len(values), len(self.weight))
+            )
+        # Keep a defensive copy of the accepted input for backward.
+        self._last = list(values)
+        return sum(w * a for w, a in zip(self.weight, values)) + self.bias
 
     def backward(self, grad):
+        # Missing forward is a state error and takes priority over the type
+        # of grad, matching the pre-existing RuntimeError contract.
+        if self._last is None:
+            raise RuntimeError("backward requires a cached forward pass; call forward first")
+        if not _is_number(grad):
+            raise ValueError("grad must be an int or float")
         # Gradients are accumulated item by item across repeated calls.
-        self.grad = [g + grad * a for g, a in zip(self.grad, self.last)]
+        last = self._last
+        self.grad = [g + grad * a for g, a in zip(self.grad, last)]
         self.grad_bias += grad
         return [grad * w for w in self.weight]
 
@@ -60,6 +106,9 @@ class Linear:
         self.grad_bias = 0.0
 
     def apply_gradients(self, learning_rate):
+        # Reject illegal learning rates before mutating any parameter.
+        if not _is_number(learning_rate):
+            raise ValueError("learning_rate must be an int or float")
         for j in range(len(self.weight)):
             self.weight[j] = self.weight[j] - learning_rate * self.grad[j]
         self.bias = self.bias - learning_rate * self.grad_bias
