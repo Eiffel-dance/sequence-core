@@ -74,22 +74,30 @@ class Linear:
         self.grad = [0.0] * len(self.weight)
         self.grad_bias = 0.0
         self.last = None
+        # Snapshot of the weights used by the cached forward pass. Kept
+        # separate from self.weight so a parameter update between forward and
+        # backward cannot change the input gradients of the recorded pass.
+        self._last_weight = None
 
     def forward(self, x):
         values = _read_number_sequence(x, len(self.weight), "x")
         result = sum(w * a for w, a in zip(self.weight, values)) + self.bias
-        # Cache only after validation and computation succeed.
+        # Cache only after validation and computation succeed. Record the
+        # inputs together with the exact weights that produced the output.
         self.last = values
+        self._last_weight = list(self.weight)
         return result
 
     def backward(self, grad):
         if self.last is None:
             raise RuntimeError("backward requires a successful forward call first")
         _read_number(grad, "grad")
-        # Gradients are accumulated item by item across repeated calls.
+        # Gradients are accumulated item by item across repeated calls, using
+        # the cached inputs of the recorded forward pass.
         self.grad = [g + grad * a for g, a in zip(self.grad, self.last)]
         self.grad_bias += grad
-        return [grad * w for w in self.weight]
+        # Input gradients must use the weights as they were at forward time.
+        return [grad * w for w in self._last_weight]
 
     def zero_grad(self):
         self.grad = [0.0] * len(self.weight)
@@ -130,6 +138,9 @@ class TanhSequence:
         prev_hiddens = []
         outputs = []
         boundaries = set()
+        # Parameter state of this forward pass. A later apply_gradients()
+        # must not affect backward() of the recorded pass.
+        weights = list(self.linear.weight)
 
         self.hidden = 0.0
         for i, row in enumerate(rows):
@@ -144,13 +155,16 @@ class TanhSequence:
             outputs.append(self.hidden)
 
         self.outputs = outputs
-        # Cache of this forward pass for backward().
+        # Cache of this forward pass for backward(). Only committed once the
+        # whole traversal succeeded, so an illegal row leaves any earlier
+        # successful record intact.
         self._fwd = {
             "inputs": inputs,
             "prev_hiddens": prev_hiddens,
             "outputs": outputs,
             "boundaries": boundaries,
             "truncate": truncate,
+            "weights": weights,
         }
         return self.outputs
 
@@ -162,11 +176,11 @@ class TanhSequence:
         prev_hiddens = self._fwd["prev_hiddens"]
         outputs = self._fwd["outputs"]
         boundaries = self._fwd["boundaries"]
+        w_input = self._fwd["weights"][0]
+        w_hidden = self._fwd["weights"][1]
         n = len(outputs)
         grad_outputs = _read_grad_list(grad_outputs, n)
 
-        w_input = self.linear.weight[0]
-        w_hidden = self.linear.weight[1]
         input_grads = [0.0] * n
 
         # Hidden-state gradient propagated from step t + 1 back into step t.
