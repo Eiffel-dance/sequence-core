@@ -134,6 +134,19 @@ class TanhSequence:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
 
+        # Snapshot every piece of observable state the traversal may touch so
+        # that any failure rolls the sequence back to its pre-call state: a
+        # rejected traversal must leave neither a half-advanced hidden state
+        # nor a partial Linear forward record, and must leave any earlier
+        # successful forward cache available for backward().
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_fwd = self._fwd
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+
         inputs = []
         prev_hiddens = []
         outputs = []
@@ -142,18 +155,31 @@ class TanhSequence:
         # must not affect backward() of the recorded pass.
         weights = list(self.linear.weight)
 
-        self.hidden = 0.0
-        for i, row in enumerate(rows):
-            if truncate is not None and i % truncate == 0:
-                # Segment start: hidden state is reset to zero.
-                self.hidden = 0.0
-                boundaries.add(i)
-            x = _read_row(row)
-            prev_hiddens.append(self.hidden)
-            self.hidden = math.tanh(self.linear.forward([x, self.hidden]))
-            inputs.append(x)
-            outputs.append(self.hidden)
+        # The traversal works on locals only; self.* is committed solely on
+        # full success below.
+        hidden = 0.0
+        try:
+            for i, row in enumerate(rows):
+                if truncate is not None and i % truncate == 0:
+                    # Segment start: hidden state is reset to zero.
+                    hidden = 0.0
+                    boundaries.add(i)
+                x = _read_row(row)
+                prev_hiddens.append(hidden)
+                hidden = math.tanh(self.linear.forward([x, hidden]))
+                inputs.append(x)
+                outputs.append(hidden)
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self._fwd = saved_fwd
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            raise
 
+        self.hidden = hidden
         self.outputs = outputs
         # Cache of this forward pass for backward(). Only committed once the
         # whole traversal succeeded, so an illegal row leaves any earlier
