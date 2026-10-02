@@ -78,8 +78,15 @@ class Linear:
     def forward(self, x):
         values = _read_number_sequence(x, len(self.weight), "x")
         result = sum(w * a for w, a in zip(self.weight, values)) + self.bias
-        # Cache only after validation and computation succeed.
-        self.last = values
+        # Cache only after validation and computation succeed. The cache
+        # records the parameter state that produced this output so a later
+        # backward() stays consistent even if apply_gradients() ran in
+        # between; apply_gradients()/zero_grad() never invalidate it.
+        self.last = {
+            "x": values,
+            "weight": list(self.weight),
+            "bias": self.bias,
+        }
         return result
 
     def backward(self, grad):
@@ -87,9 +94,11 @@ class Linear:
             raise RuntimeError("backward requires a successful forward call first")
         _read_number(grad, "grad")
         # Gradients are accumulated item by item across repeated calls.
-        self.grad = [g + grad * a for g, a in zip(self.grad, self.last)]
+        self.grad = [g + grad * a for g, a in zip(self.grad, self.last["x"])]
         self.grad_bias += grad
-        return [grad * w for w in self.weight]
+        # Input gradients use the weights as they were during the cached
+        # forward pass, not the possibly updated current weights.
+        return [grad * w for w in self.last["weight"]]
 
     def zero_grad(self):
         self.grad = [0.0] * len(self.weight)
@@ -144,13 +153,17 @@ class TanhSequence:
             outputs.append(self.hidden)
 
         self.outputs = outputs
-        # Cache of this forward pass for backward().
+        # Cache of this forward pass for backward(). The linear weights are
+        # snapshotted so backward() reflects this pass even if the parameters
+        # are updated before backward() runs.
         self._fwd = {
             "inputs": inputs,
             "prev_hiddens": prev_hiddens,
             "outputs": outputs,
             "boundaries": boundaries,
             "truncate": truncate,
+            "w_input": self.linear.weight[0],
+            "w_hidden": self.linear.weight[1],
         }
         return self.outputs
 
@@ -165,8 +178,8 @@ class TanhSequence:
         n = len(outputs)
         grad_outputs = _read_grad_list(grad_outputs, n)
 
-        w_input = self.linear.weight[0]
-        w_hidden = self.linear.weight[1]
+        w_input = self._fwd["w_input"]
+        w_hidden = self._fwd["w_hidden"]
         input_grads = [0.0] * n
 
         # Hidden-state gradient propagated from step t + 1 back into step t.
