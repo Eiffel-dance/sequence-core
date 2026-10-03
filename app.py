@@ -28,6 +28,20 @@ def _read_number_sequence(values, expected_length, what):
     return result
 
 
+def _read_flag_sequence(values, what):
+    """Validate a non-text, non-bytes sequence of booleans."""
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise ValueError("%s must be a non-text, non-bytes sequence of booleans" % what)
+    if not isinstance(values, Sequence):
+        raise ValueError("%s must be a sequence of booleans" % what)
+    result = []
+    for value in values:
+        if not isinstance(value, bool):
+            raise ValueError("each element of %s must be a boolean" % what)
+        result.append(value)
+    return result
+
+
 def _read_row(row, width):
     """Validate a non-text sequence of ``width`` numbers and return them."""
     if isinstance(row, (str, bytes, bytearray, memoryview)):
@@ -146,14 +160,23 @@ class TanhSequence:
         # Any half-finished stream session is abandoned as well.
         self._stream = None
 
-    def step(self, row):
-        # Validate before any state is touched, so a rejected row changes
+    def step(self, row, segment_start=False):
+        # The boundary marker is an actual boolean; validated together with
+        # the row before any state is touched, so a rejected call changes
         # neither hidden/outputs nor the Linear's last-forward record, and a
         # batch forward cache stays available for backward().
+        if not isinstance(segment_start, bool):
+            raise ValueError("segment_start must be a boolean")
         values = _read_row(row, self.d)
         stream = self._stream
         if stream is not None:
-            return self._stream_step(stream, values)
+            return self._stream_step(stream, values, segment_start)
+        if segment_start:
+            # Declaring a boundary only makes sense while a stream session
+            # records the trajectory; outside one there is no cache to keep
+            # consistent with a batch traversal.
+            raise RuntimeError(
+                "segment_start requires an active stream session")
         # Compute into a local first; only commit once the Linear forward and
         # the tanh succeeded.
         new_hidden = math.tanh(self.linear.forward(values + [self.hidden]))
@@ -164,14 +187,15 @@ class TanhSequence:
         self._fwd = None
         return new_hidden
 
-    def _stream_step(self, stream, values):
+    def _stream_step(self, stream, values, segment_start):
         # One step inside an active stream session. The row is already
         # validated; the step follows the same segment-boundary rules as the
         # batch traversal so the recorded trajectory back-propagates with the
-        # shared formulas once finish_stream commits it.
+        # shared formulas once finish_stream commits it. A declared
+        # segment_start merges with the truncate boundaries for this row only.
         i = len(stream["inputs"])
         truncate = stream["truncate"]
-        if truncate is not None and i % truncate == 0:
+        if (truncate is not None and i % truncate == 0) or segment_start:
             # Segment start. The first segment starts from the session's
             # initial hidden state; without carry every later segment resets
             # to zero; with carry it starts from a numeric copy of the
@@ -252,7 +276,8 @@ class TanhSequence:
         self._stream = None
         return list(stream["outputs"])
 
-    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
+    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None,
+                segment_starts=None):
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
@@ -270,6 +295,25 @@ class TanhSequence:
             initial_hidden = 0.0
         else:
             initial_hidden = _read_number(initial_hidden, "initial_hidden")
+        # Optional per-row boundary declarations: one boolean per input row,
+        # read in row order. A true entry starts a new truncated segment at
+        # that row, merged with the truncate boundaries; the position-0 entry
+        # only confirms the initial boundary that every traversal starts
+        # with. Validated (type and length) before any state, cache, or
+        # Linear forward record is touched, so a rejected declaration changes
+        # nothing.
+        declared = None
+        if segment_starts is not None:
+            declared = _read_flag_sequence(segment_starts, "segment_starts")
+            try:
+                row_count = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_starts requires rows to be a sized sequence")
+            if len(declared) != row_count:
+                raise ValueError(
+                    "segment_starts length %d does not match row count %d"
+                    % (len(declared), row_count))
 
         # Snapshot every piece of observable state the traversal may touch so
         # that any failure rolls the sequence back to its pre-call state: a
@@ -299,10 +343,12 @@ class TanhSequence:
         hidden = initial_hidden
         try:
             for i, row in enumerate(rows):
-                if truncate is not None and i % truncate == 0:
-                    # Segment start. The very first segment starts from
-                    # initial_hidden; without carry every later segment is
-                    # reset to zero; with carry every later segment starts
+                if (truncate is not None and i % truncate == 0) \
+                        or (declared is not None and declared[i]):
+                    # Segment start, either from the fixed truncate grid or
+                    # from a declared boundary. The very first segment starts
+                    # from initial_hidden; without carry every later segment
+                    # is reset to zero; with carry every later segment starts
                     # from a numeric copy of the previous segment's last
                     # hidden value. The value is detached from the autograd
                     # graph: it enters the local derivatives of this
