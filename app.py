@@ -408,7 +408,23 @@ class TanhSequence:
         # gradient with respect to that forward's initial_hidden as well.
         return self._backward(grad_outputs, grad_hidden, return_initial=True)
 
-    def _backward(self, grad_outputs, grad_hidden, return_initial):
+    def backward_with_boundaries(self, grad_outputs, grad_hidden=0.0):
+        # Like backward_with_initial_hidden(), but additionally reports the
+        # hidden-state gradient arriving at every segment start past index 0.
+        # The third return value is a list of (index, gradient) pairs in
+        # ascending index order, built from the cached pass's merged boundary
+        # set (truncate-produced and explicitly declared starts, deduplicated).
+        # Each gradient is taken with respect to the detached boundary
+        # constant consumed at that start: the numeric copy of the previous
+        # segment's final hidden value when carry_hidden was true, the zero
+        # constant otherwise. Index 0 is not listed; its gradient is the
+        # returned grad_initial_hidden. With no nonzero boundaries (or an
+        # empty cached sequence) the list is empty.
+        return self._backward(grad_outputs, grad_hidden, return_initial=True,
+                              return_boundaries=True)
+
+    def _backward(self, grad_outputs, grad_hidden, return_initial,
+                  return_boundaries=False):
         if self._stream is not None:
             raise RuntimeError(
                 "backward requires the stream session to be finished first")
@@ -434,6 +450,9 @@ class TanhSequence:
         grad_hidden = _read_number(grad_hidden, "grad_hidden")
 
         input_grads = [0.0] * n
+        # Hidden-state gradients recorded at segment starts past index 0, in
+        # traversal (descending) order; reversed into ascending order below.
+        boundary_grads = []
 
         # The terminal hidden-state gradient seeds the recurrence at the last
         # step, where it is added to that step's output gradient. A zero seed
@@ -472,11 +491,19 @@ class TanhSequence:
             if t in boundaries:
                 # Truncated BPTT: segment-start hidden values (zeroed or
                 # carried as detached numbers) are constants, so no gradient
-                # crosses back into the prior segment.
+                # crosses back into the prior segment. For a start past
+                # index 0, d_pre * w_hidden is the total gradient the merged
+                # within-segment recurrence delivers to that detached
+                # boundary constant; record it before severing the link.
+                if return_boundaries and t > 0:
+                    boundary_grads.append((t, d_pre * w_hidden))
                 hidden_grad = 0.0
             else:
                 hidden_grad = d_pre * w_hidden
 
+        if return_boundaries:
+            boundary_grads.reverse()
+            return input_grads, grad_initial_hidden, boundary_grads
         if return_initial:
             return input_grads, grad_initial_hidden
         return input_grads
