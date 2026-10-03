@@ -47,6 +47,21 @@ def _read_row(row, width):
     return values
 
 
+def _read_bool_sequence(values, what):
+    """Validate a non-text, non-bytes sequence of booleans and return it."""
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise ValueError("%s must be a non-text sequence of booleans" % what)
+    if not isinstance(values, Sequence):
+        raise ValueError("%s must be a sequence of booleans" % what)
+    result = []
+    for value in values:
+        # Only an actual bool is accepted (bool is a subclass of int).
+        if not isinstance(value, bool):
+            raise ValueError("each element of %s must be a bool" % what)
+        result.append(value)
+    return result
+
+
 def _read_grad_list(values, expected_length):
     """Validate an output-gradient list and return it as a list of floats."""
     if isinstance(values, (str, bytes, bytearray, memoryview)):
@@ -146,14 +161,22 @@ class TanhSequence:
         # Any half-finished stream session is abandoned as well.
         self._stream = None
 
-    def step(self, row):
+    def step(self, row, segment_start=False):
         # Validate before any state is touched, so a rejected row changes
         # neither hidden/outputs nor the Linear's last-forward record, and a
         # batch forward cache stays available for backward().
+        if not isinstance(segment_start, bool):
+            raise ValueError("segment_start must be a boolean")
         values = _read_row(row, self.d)
         stream = self._stream
         if stream is not None:
-            return self._stream_step(stream, values)
+            return self._stream_step(stream, values, segment_start)
+        if segment_start:
+            # Explicit boundary marks are only meaningful inside a session;
+            # outside one there is no recorded trajectory to cut.
+            raise RuntimeError(
+                "segment_start=True requires an active stream session; "
+                "call start_stream first")
         # Compute into a local first; only commit once the Linear forward and
         # the tanh succeeded.
         new_hidden = math.tanh(self.linear.forward(values + [self.hidden]))
@@ -164,20 +187,23 @@ class TanhSequence:
         self._fwd = None
         return new_hidden
 
-    def _stream_step(self, stream, values):
-        # One step inside an active stream session. The row is already
-        # validated; the step follows the same segment-boundary rules as the
-        # batch traversal so the recorded trajectory back-propagates with the
-        # shared formulas once finish_stream commits it.
+    def _stream_step(self, stream, values, segment_start):
+        # One step inside an active stream session. The row and the boundary
+        # flag are already validated; the step follows the same segment-
+        # boundary rules as the batch traversal so the recorded trajectory
+        # back-propagates with the shared formulas once finish_stream commits
+        # it.
         i = len(stream["inputs"])
         truncate = stream["truncate"]
-        if truncate is not None and i % truncate == 0:
+        truncate_boundary = truncate is not None and i % truncate == 0
+        if truncate_boundary or segment_start:
             # Segment start. The first segment starts from the session's
             # initial hidden state; without carry every later segment resets
             # to zero; with carry it starts from a numeric copy of the
             # previous segment's last hidden value. That copy is detached: it
             # enters this step's local derivatives but no gradient crosses
-            # back over the boundary.
+            # back over the boundary. Explicit segment_start marks merge with
+            # the truncate-produced boundaries.
             if i == 0:
                 hidden = stream["initial_hidden"]
             elif stream["carry_hidden"]:
@@ -252,7 +278,8 @@ class TanhSequence:
         self._stream = None
         return list(stream["outputs"])
 
-    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
+    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None,
+                segment_starts=None):
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
@@ -270,6 +297,22 @@ class TanhSequence:
             initial_hidden = 0.0
         else:
             initial_hidden = _read_number(initial_hidden, "initial_hidden")
+        # Optional per-row boundary declarations, read in input-row order.
+        # None keeps the existing behavior; otherwise one bool per row is
+        # required, validated (type and length) before any state is touched.
+        if segment_starts is not None:
+            segment_flags = _read_bool_sequence(segment_starts, "segment_starts")
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_starts requires a sized rows sequence")
+            if len(segment_flags) != n_rows:
+                raise ValueError(
+                    "segment_starts length %d does not match rows length %d"
+                    % (len(segment_flags), n_rows))
+        else:
+            segment_flags = None
 
         # Snapshot every piece of observable state the traversal may touch so
         # that any failure rolls the sequence back to its pre-call state: a
@@ -299,7 +342,8 @@ class TanhSequence:
         hidden = initial_hidden
         try:
             for i, row in enumerate(rows):
-                if truncate is not None and i % truncate == 0:
+                declared = segment_flags is not None and segment_flags[i]
+                if (truncate is not None and i % truncate == 0) or declared:
                     # Segment start. The very first segment starts from
                     # initial_hidden; without carry every later segment is
                     # reset to zero; with carry every later segment starts
@@ -307,6 +351,9 @@ class TanhSequence:
                     # hidden value. The value is detached from the autograd
                     # graph: it enters the local derivatives of this
                     # segment's first step but no gradient crosses back.
+                    # Explicit segment_starts declarations merge with the
+                    # truncate-produced boundaries; a mark at position 0 only
+                    # confirms the initial boundary.
                     if i > 0 and carry_hidden:
                         hidden = outputs[-1]
                     elif i > 0:
