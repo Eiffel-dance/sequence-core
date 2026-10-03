@@ -1026,19 +1026,22 @@ class StreamSessionTest(unittest.TestCase):
 
 
 class TanhSequenceConstructionTest(unittest.TestCase):
-    def test_requires_two_weight_linear(self):
+    def test_requires_linear_with_at_least_two_weights(self):
         with self.assertRaises(ValueError):
             TanhSequence(Linear([0.5]))
-        with self.assertRaises(ValueError):
-            TanhSequence(Linear([0.5, 0.1, 0.2]))
         with self.assertRaises(ValueError):
             TanhSequence("not a linear")
         with self.assertRaises(ValueError):
             TanhSequence(object())
 
+    def test_accepts_two_or_more_weights(self):
+        self.assertEqual(TanhSequence(Linear([0.5, 0.1])).d, 1)
+        self.assertEqual(TanhSequence(Linear([0.5, 0.1, 0.2])).d, 2)
+        self.assertEqual(TanhSequence(Linear([0.5, 0.1, 0.2, -0.4, 0.7])).d, 4)
+
     def test_rejected_construction_leaves_linear_untouched(self):
-        lin = Linear([0.5, 0.1, 0.2], 0.3)
-        lin.forward([1.0, 2.0, 3.0])
+        lin = Linear([0.5], 0.3)
+        lin.forward([1.0])
         lin.backward(0.4)
         weight, grads, grad_bias, last = (
             list(lin.weight), list(lin.grad), lin.grad_bias, list(lin.last))
@@ -1048,6 +1051,275 @@ class TanhSequenceConstructionTest(unittest.TestCase):
         self.assertEqual(lin.grad, grads)
         self.assertEqual(lin.grad_bias, grad_bias)
         self.assertEqual(lin.last, last)
+
+
+# Multi-feature sample: two input features plus the recurrent weight.
+WM = [0.4, -0.3, 0.2]
+BM = 0.15
+ROWSM = [[0.8, -0.2], [-0.5, 1.1], [1.2, 0.4], [-0.7, -0.9], [0.3, 0.6]]
+GOM = [0.3, -0.6, 0.9, -0.2, 0.5]
+
+
+def sequence_outputs_rows(weight, bias, rows, h0, truncate, carry, frozen=None):
+    """tanh(sum_k w_k*x_k + w_rec*h_prev + b) over multi-feature rows."""
+    d = len(weight) - 1
+    outs = []
+    hidden = h0
+    for i, row in enumerate(rows):
+        if truncate is not None and i % truncate == 0:
+            if i == 0:
+                hidden = h0
+            elif frozen is not None:
+                hidden = frozen[i]
+            elif carry:
+                hidden = outs[-1]
+            else:
+                hidden = 0.0
+        pre = sum(weight[k] * row[k] for k in range(d)) + weight[d] * hidden + bias
+        hidden = math.tanh(pre)
+        outs.append(hidden)
+    return outs
+
+
+def frozen_boundaries_rows(rows, truncate, carry, weight, bias, h0):
+    if truncate is None:
+        return {}
+    base = sequence_outputs_rows(weight, bias, rows, h0, truncate, carry)
+    frozen = {}
+    for i in range(1, len(rows)):
+        if i % truncate == 0:
+            frozen[i] = base[i - 1] if carry else 0.0
+    return frozen
+
+
+def objective_rows(weight, bias, rows, h0, grad_outputs, grad_hidden,
+                   truncate, carry, frozen):
+    outs = sequence_outputs_rows(weight, bias, rows, h0, truncate, carry, frozen)
+    if not outs:
+        return grad_hidden * h0
+    return sum(g * o for g, o in zip(grad_outputs, outs)) + grad_hidden * outs[-1]
+
+
+class MultiFeatureSequenceTest(unittest.TestCase):
+    D = len(WM) - 1
+
+    def fresh(self):
+        return TanhSequence(Linear(list(WM), BM))
+
+    def test_forward_matches_reference_formula(self):
+        for truncate, carry, h0 in ((None, False, 0.0), (None, False, H0),
+                                    (1, False, 0.0), (1, True, H0),
+                                    (2, False, 0.0), (2, True, H0),
+                                    (3, True, 0.0), (100, False, H0)):
+            seq = self.fresh()
+            outs = seq.forward(ROWSM, truncate, carry, h0)
+            expected = sequence_outputs_rows(WM, BM, ROWSM, h0, truncate, carry)
+            self.assertTrue(allclose(outs, expected, atol=1e-12),
+                            "truncate=%r carry=%r h0=%r" % (truncate, carry, h0))
+            self.assertTrue(close(seq.hidden, expected[-1], atol=1e-12))
+            self.assertEqual(seq.outputs, outs)
+
+    def test_empty_forward_and_gradients(self):
+        seq = self.fresh()
+        self.assertEqual(seq.forward([], truncate=2, carry_hidden=True,
+                                     initial_hidden=H0), [])
+        self.assertTrue(close(seq.hidden, H0, atol=1e-15))
+        input_grads, grad_initial = seq.backward_with_initial_hidden([], GH)
+        self.assertEqual(input_grads, [])
+        self.assertTrue(close(grad_initial, GH, atol=1e-15))
+        self.assertEqual(seq.linear.grad, [0.0] * len(WM))
+        self.assertEqual(seq.backward([]), [])
+
+    def _check_gradients(self, rows, truncate, carry, h0, grad_hidden):
+        go = GOM[:len(rows)]
+        frozen = frozen_boundaries_rows(rows, truncate, carry, WM, BM, h0)
+        seq = self.fresh()
+        seq.forward(rows, truncate, carry, h0)
+        input_grads, grad_initial = seq.backward_with_initial_hidden(go, grad_hidden)
+
+        def obj(weight, bias, inputs, initial):
+            return objective_rows(weight, bias, inputs, initial, go, grad_hidden,
+                                  truncate, carry, frozen)
+
+        # Input gradients mirror the input shape: one row of d gradients per
+        # step, each matching the finite difference of that feature.
+        self.assertEqual(len(input_grads), len(rows))
+        for t in range(len(rows)):
+            self.assertEqual(len(input_grads[t]), self.D)
+            for k in range(self.D):
+                fd = central(lambda dd, t=t, k=k: obj(
+                    WM, BM,
+                    [[v + (dd if j == k else 0.0) for j, v in enumerate(row)]
+                     if i == t else list(row) for i, row in enumerate(rows)],
+                    h0))
+                self.assertTrue(close(input_grads[t][k], fd),
+                                "input grad t=%d k=%d: %r vs %r"
+                                % (t, k, input_grads[t][k], fd))
+        # Every weight (input coefficients and the recurrent coefficient) and
+        # the bias accumulate on the same Linear.
+        for k in range(len(WM)):
+            fd = central(lambda dd, k=k: obj(
+                [w + (dd if j == k else 0.0) for j, w in enumerate(WM)],
+                BM, rows, h0))
+            self.assertTrue(close(seq.linear.grad[k], fd),
+                            "weight grad %d: %r vs %r" % (k, seq.linear.grad[k], fd))
+        self.assertTrue(close(seq.linear.grad_bias,
+                              central(lambda dd: obj(WM, BM + dd, rows, h0))))
+        self.assertTrue(close(grad_initial,
+                              central(lambda dd: obj(WM, BM, rows, h0 + dd))))
+        return seq, input_grads
+
+    def test_backward_matches_finite_differences(self):
+        self._check_gradients(ROWSM, None, False, 0.0, 0.0)
+        self._check_gradients(ROWSM, None, False, H0, GH)
+        self._check_gradients(ROWSM, 1, False, 0.0, GH)
+        self._check_gradients(ROWSM, 1, True, H0, GH)
+        self._check_gradients(ROWSM, 2, False, H0, 0.0)
+        self._check_gradients(ROWSM, 2, True, H0, GH)
+        self._check_gradients(ROWSM, 3, True, 0.0, GH)
+        self._check_gradients(ROWSM, 100, False, H0, GH)
+        self._check_gradients(ROWSM[:1], None, False, H0, GH)
+
+    def test_plain_backward_returns_nested_rows(self):
+        seq = self.fresh()
+        seq.forward(ROWSM, truncate=2, carry_hidden=True, initial_hidden=H0)
+        input_grads = seq.backward(GOM)
+        self.assertEqual(len(input_grads), len(ROWSM))
+        for row_grads in input_grads:
+            self.assertIsInstance(row_grads, list)
+            self.assertEqual(len(row_grads), self.D)
+        # backward() with a zero terminal seed matches the seeded entry.
+        twin = self.fresh()
+        twin.forward(ROWSM, truncate=2, carry_hidden=True, initial_hidden=H0)
+        seeded, _ = twin.backward_with_initial_hidden(GOM, 0.0)
+        for a, b in zip(input_grads, seeded):
+            self.assertTrue(allclose(a, b, atol=1e-15))
+
+    def test_step_and_stream_match_batch(self):
+        # A plain stepwise walk never truncates; it matches the untruncated
+        # batch traversal from the same initial hidden state.
+        untruncated = self.fresh()
+        untruncated_outs = untruncated.forward(ROWSM, None, False, H0)
+        stepped = self.fresh()
+        stepped.forward([], initial_hidden=H0)
+        step_outs = [stepped.step(list(row)) for row in ROWSM]
+        self.assertTrue(allclose(step_outs, untruncated_outs, atol=1e-15))
+        self.assertTrue(close(stepped.hidden, untruncated.hidden, atol=1e-15))
+
+        for truncate, carry in ((None, False), (1, True), (2, True), (3, False)):
+            batched = self.fresh()
+            batch_outs = batched.forward(ROWSM, truncate, carry, H0)
+
+            streamed = self.fresh()
+            streamed.start_stream(initial_hidden=H0, truncate=truncate,
+                                  carry_hidden=carry)
+            stream_outs = [streamed.step(list(row)) for row in ROWSM]
+            returned = streamed.finish_stream()
+            self.assertTrue(allclose(stream_outs, batch_outs, atol=1e-15))
+            self.assertTrue(allclose(returned, batch_outs, atol=1e-15))
+
+            # The finished session back-propagates exactly like the batch pass.
+            batch_inputs, batch_initial = batched.backward_with_initial_hidden(GOM, GH)
+            stream_inputs, stream_initial = streamed.backward_with_initial_hidden(GOM, GH)
+            for a, b in zip(stream_inputs, batch_inputs):
+                self.assertTrue(allclose(a, b, atol=1e-15))
+            self.assertTrue(close(stream_initial, batch_initial, atol=1e-15))
+            self.assertTrue(allclose(streamed.linear.grad, batched.linear.grad,
+                                     atol=1e-15))
+            self.assertTrue(close(streamed.linear.grad_bias,
+                                  batched.linear.grad_bias, atol=1e-15))
+
+    def test_truncated_stream_severs_gradient_at_boundaries(self):
+        go = GOM[:4]
+        base = self.fresh()
+        base.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for row in ROWSM[:4]:
+            base.step(list(row))
+        base.finish_stream()
+        base_grads = base.backward(go)
+
+        shifted = self.fresh()
+        shifted.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for row in ROWSM[:4]:
+            shifted.step(list(row))
+        shifted.finish_stream()
+        moved = shifted.backward([go[0], go[1], go[2], go[3] + 0.7])
+        self.assertTrue(allclose(moved[0], base_grads[0], atol=1e-15))
+        self.assertTrue(allclose(moved[1], base_grads[1], atol=1e-15))
+        self.assertFalse(allclose(moved[2], base_grads[2], atol=1e-9))
+        self.assertFalse(allclose(moved[3], base_grads[3], atol=1e-9))
+
+    def test_invalid_rows_raise_and_roll_back_all_state(self):
+        seq = self.fresh()
+        seq.forward(ROWSM, truncate=2)
+        seq.backward(GOM)
+        snapshot = (seq.hidden, list(seq.outputs), list(seq.linear.last),
+                    list(seq.linear.grad), seq.linear.grad_bias)
+        bad_row_sets = (
+            [[1.0]],                          # too narrow
+            [[1.0, 2.0, 3.0]],                # too wide
+            [[1.0, 2.0], [1.0]],              # bad width mid-traversal
+            [[1.0, "x"]],                     # non-numeric element
+            [[True, 1.0]],                    # bool element
+            [[1.0, 2.0], None],               # non-sequence row
+            [[1.0, 2.0], 7],                  # scalar row
+            ["ab"],                           # text row
+            [b"ab"],                          # bytes row
+        )
+        for bad_rows in bad_row_sets:
+            with self.assertRaises(ValueError):
+                seq.forward(bad_rows, truncate=2)
+            self.assertEqual(seq.hidden, snapshot[0])
+            self.assertEqual(seq.outputs, snapshot[1])
+            self.assertEqual(seq.linear.last, snapshot[2])
+            self.assertEqual(seq.linear.grad, snapshot[3])
+            self.assertEqual(seq.linear.grad_bias, snapshot[4])
+        # The pre-error cache is still fully back-propagatable.
+        self.assertEqual(len(seq.backward(GOM)), len(ROWSM))
+
+    def test_invalid_step_row_changes_nothing(self):
+        seq = self.fresh()
+        seq.forward(ROWSM[:2])
+        hidden_before, outputs_before = seq.hidden, list(seq.outputs)
+        last_before = list(seq.linear.last)
+        for bad_row in ([1.0], [1.0, 2.0, 3.0], [1.0, "x"], [True, 0.5],
+                        "ab", b"ab", 7, None):
+            with self.assertRaises(ValueError):
+                seq.step(bad_row)
+        self.assertEqual(seq.hidden, hidden_before)
+        self.assertEqual(seq.outputs, outputs_before)
+        self.assertEqual(seq.linear.last, last_before)
+        # The batch cache survived every rejected step.
+        self.assertEqual(len(seq.backward(GOM[:2])), 2)
+
+    def test_invalid_row_mid_session_changes_nothing_and_session_continues(self):
+        seq = self.fresh()
+        seq.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        seq.step(list(ROWSM[0]))
+        hidden_before = seq.hidden
+        last_before = list(seq.linear.last)
+        for bad_row in ([1.0], [1.0, 2.0, 3.0], ["x", 1.0], [True, 1.0],
+                        7, "ab"):
+            with self.assertRaises(ValueError):
+                seq.step(bad_row)
+        self.assertEqual(seq.hidden, hidden_before)
+        self.assertEqual(seq.outputs, [hidden_before])
+        self.assertEqual(seq.linear.last, last_before)
+        for row in ROWSM[1:]:
+            seq.step(list(row))
+        returned = seq.finish_stream()
+        self.assertTrue(allclose(
+            returned, sequence_outputs_rows(WM, BM, ROWSM, H0, 2, True),
+            atol=1e-15))
+
+    def test_scalar_sequence_behavior_is_unchanged(self):
+        # d == 1 keeps the flat scalar gradient list, not nested rows.
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        input_grads = seq.backward(GO)
+        self.assertEqual(len(input_grads), len(ROWS))
+        for grad in input_grads:
+            self.assertIsInstance(grad, float)
 
 
 if __name__ == "__main__":
