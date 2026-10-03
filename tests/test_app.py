@@ -760,6 +760,271 @@ def _inputs_only(weight, bias, rows, truncate, carry, h0, go):
     return seq.backward(go)
 
 
+class StreamSessionTest(unittest.TestCase):
+    def _run_stream(self, xs, truncate=None, carry=False, h0=None):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=h0, truncate=truncate, carry_hidden=carry)
+        stepped = [seq.step([x]) for x in xs]
+        returned = seq.finish_stream()
+        return seq, stepped, returned
+
+    def test_stream_outputs_match_batch_trajectory(self):
+        for truncate, carry in ((None, False), (1, False), (1, True),
+                                (2, False), (2, True), (3, True), (100, False)):
+            for h0 in (None, H0):
+                seq, stepped, returned = self._run_stream(
+                    XS, truncate, carry, h0)
+                expected = sequence_outputs(W, B, XS, h0 or 0.0, truncate, carry)
+                self.assertTrue(allclose(stepped, expected, atol=1e-15),
+                                "truncate=%r carry=%r h0=%r" % (truncate, carry, h0))
+                # finish_stream returns the hidden states in arrival order.
+                self.assertTrue(allclose(returned, expected, atol=1e-15))
+                self.assertEqual(seq.outputs, returned)
+                self.assertIsNot(returned, seq.outputs)
+                self.assertTrue(close(seq.hidden, expected[-1], atol=1e-15))
+
+    def test_start_stream_returns_none_and_clears_outputs(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, initial_hidden=H0)
+        self.assertNotEqual(seq.outputs, [])
+        self.assertIsNone(seq.start_stream(initial_hidden=H0))
+        self.assertEqual(seq.outputs, [])
+        self.assertTrue(close(seq.hidden, H0, atol=1e-15))
+
+    def test_start_stream_default_initial_hidden_is_zero(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream()
+        self.assertEqual(seq.hidden, 0.0)
+        out = seq.step([XS[0]])
+        self.assertTrue(close(out, math.tanh(W[0] * XS[0] + B), atol=1e-15))
+
+    def test_start_stream_invalidates_cache_but_keeps_linear_state(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2)
+        seq.backward(GO)
+        weight, grads = list(seq.linear.weight), list(seq.linear.grad)
+        grad_bias, last = seq.linear.grad_bias, list(seq.linear.last)
+        seq.start_stream()
+        with self.assertRaises(RuntimeError):
+            seq.backward(GO)
+        self.assertEqual(seq.linear.weight, weight)
+        self.assertEqual(seq.linear.grad, grads)
+        self.assertEqual(seq.linear.grad_bias, grad_bias)
+        self.assertEqual(seq.linear.last, last)
+
+    def _check_stream_gradients(self, xs, truncate, carry, h0, grad_hidden):
+        """Stream gradients must equal the batch gradients, which the batch
+        tests already pinned against finite differences of the reference."""
+        go = GO[:len(xs)]
+        seq, _, _ = self._run_stream(xs, truncate, carry, h0)
+        input_grads, grad_initial = seq.backward_with_initial_hidden(go, grad_hidden)
+
+        ref = fresh_sequence(W, B)
+        ref.forward([[x] for x in xs], truncate, carry, h0)
+        ref_inputs, ref_initial = ref.backward_with_initial_hidden(go, grad_hidden)
+        self.assertTrue(allclose(input_grads, ref_inputs, atol=1e-15))
+        self.assertTrue(close(grad_initial, ref_initial, atol=1e-15))
+        self.assertTrue(allclose(seq.linear.grad, ref.linear.grad, atol=1e-15))
+        self.assertTrue(close(seq.linear.grad_bias, ref.linear.grad_bias, atol=1e-15))
+
+        # Independent finite-difference check of the stream gradients, with
+        # boundary hidden values frozen at their unperturbed trajectory.
+        frozen = frozen_boundaries(xs, truncate, carry, W, B, h0)
+        obj = lambda weight, bias, inputs, initial: objective(
+            weight, bias, inputs, initial, go, grad_hidden, truncate, carry, frozen)
+        for t in range(len(xs)):
+            fd = central(lambda d, t=t: obj(
+                W, B, [a + (d if k == t else 0.0) for k, a in enumerate(xs)], h0))
+            self.assertTrue(close(input_grads[t], fd),
+                            "input grad t=%d: %r vs %r" % (t, input_grads[t], fd))
+        self.assertTrue(close(seq.linear.grad[0],
+                              central(lambda d: obj([W[0] + d, W[1]], B, xs, h0))))
+        self.assertTrue(close(seq.linear.grad[1],
+                              central(lambda d: obj([W[0], W[1] + d], B, xs, h0))))
+        self.assertTrue(close(seq.linear.grad_bias,
+                              central(lambda d: obj(W, B + d, xs, h0))))
+        self.assertTrue(close(grad_initial,
+                              central(lambda d: obj(W, B, xs, h0 + d))))
+
+    def test_stream_gradients_no_truncation(self):
+        self._check_stream_gradients(XS, None, False, 0.0, 0.0)
+        self._check_stream_gradients(XS, None, False, H0, GH)
+
+    def test_stream_gradients_truncated(self):
+        self._check_stream_gradients(XS, 1, False, 0.0, 0.0)
+        self._check_stream_gradients(XS, 1, True, H0, GH)
+        self._check_stream_gradients(XS, 2, False, H0, GH)
+        self._check_stream_gradients(XS, 2, True, H0, GH)
+        self._check_stream_gradients(XS, 3, True, 0.0, GH)
+        self._check_stream_gradients(XS, 100, False, H0, GH)
+
+    def test_stream_plain_backward_matches_batch(self):
+        seq, _, _ = self._run_stream(XS, 2, True, H0)
+        stream_inputs = seq.backward(GO)
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, 2, True, H0)
+        self.assertTrue(allclose(stream_inputs, ref.backward(GO), atol=1e-15))
+        self.assertTrue(allclose(seq.linear.grad, ref.linear.grad, atol=1e-15))
+
+    def test_empty_session(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        self.assertEqual(seq.finish_stream(), [])
+        self.assertTrue(close(seq.hidden, H0, atol=1e-15))
+        input_grads, grad_initial = seq.backward_with_initial_hidden([], GH)
+        self.assertEqual(input_grads, [])
+        # No steps: the terminal hidden state is the initial hidden state.
+        self.assertTrue(close(grad_initial, GH, atol=1e-15))
+        self.assertEqual(seq.linear.grad, [0.0, 0.0])
+        self.assertEqual(seq.backward([]), [])
+
+    def test_single_step_session(self):
+        self._check_stream_gradients(XS[:1], None, False, H0, GH)
+        self._check_stream_gradients(XS[:1], 1, True, H0, GH)
+
+    def test_carried_boundary_uses_detached_copy(self):
+        # Perturbing the upstream gradient of the last step must move steps
+        # within its segment only, never across the boundary.
+        seq, _, _ = self._run_stream(XS[:4], 2, True, H0)
+        base = seq.backward(GO[:4])
+        shifted, _, _ = self._run_stream(XS[:4], 2, True, H0)
+        moved = shifted.backward([GO[0], GO[1], GO[2], GO[3] + 0.7])
+        self.assertTrue(close(moved[0], base[0], atol=1e-15))
+        self.assertTrue(close(moved[1], base[1], atol=1e-15))
+        self.assertFalse(close(moved[2], base[2], atol=1e-9))
+        self.assertFalse(close(moved[3], base[3], atol=1e-9))
+
+    def test_session_uses_forward_time_weights_after_update(self):
+        seq, _, returned = self._run_stream(XS, None, False, H0)
+        input_grads, _ = seq.backward_with_initial_hidden(GO, GH)
+        seq.linear.apply_gradients(0.1)
+        # The recorded session keeps its forward-time weights.
+        again, _ = seq.backward_with_initial_hidden(GO, GH)
+        self.assertTrue(allclose(again, input_grads, atol=1e-15))
+        # New sessions follow the updated parameters.
+        seq.start_stream(initial_hidden=H0)
+        moved_outs = [seq.step([x]) for x in XS]
+        seq.finish_stream()
+        self.assertTrue(allclose(
+            moved_outs,
+            sequence_outputs(seq.linear.weight, seq.linear.bias, XS, H0, None, False)))
+        self.assertFalse(allclose(moved_outs, returned, atol=1e-9))
+
+    def test_repeated_backward_accumulates(self):
+        seq, _, _ = self._run_stream(XS, 2, True, H0)
+        seq.backward(GO)
+        seq.backward(GO)
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, 2, True, H0)
+        ref.backward([2 * g for g in GO])
+        self.assertTrue(allclose(seq.linear.grad, ref.linear.grad))
+        self.assertTrue(close(seq.linear.grad_bias, ref.linear.grad_bias))
+
+    def test_finish_without_start_raises_and_preserves_state(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2)
+        seq.backward(GO)
+        snapshot = (seq.hidden, list(seq.outputs), list(seq.linear.last),
+                    list(seq.linear.grad), seq.linear.grad_bias)
+        with self.assertRaises(RuntimeError):
+            seq.finish_stream()
+        self.assertEqual(
+            (seq.hidden, list(seq.outputs), list(seq.linear.last),
+             list(seq.linear.grad), seq.linear.grad_bias), snapshot)
+        # The recorded cache is still fully usable.
+        self.assertEqual(len(seq.backward(GO)), len(ROWS))
+
+    def test_double_start_and_double_finish_raise(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0)
+        seq.step([XS[0]])
+        with self.assertRaises(RuntimeError):
+            seq.start_stream()
+        # The failed re-start must not clear the in-progress session.
+        self.assertEqual(len(seq.outputs), 1)
+        self.assertTrue(close(seq.hidden,
+                              math.tanh(W[0] * XS[0] + W[1] * H0 + B), atol=1e-15))
+        seq.step([XS[1]])
+        self.assertEqual(len(seq.finish_stream()), 2)
+        with self.assertRaises(RuntimeError):
+            seq.finish_stream()
+        # The committed cache survives the rejected second finish.
+        self.assertEqual(len(seq.backward(GO[:2])), 2)
+
+    def test_backward_during_open_session_raises(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream()
+        seq.step([XS[0]])
+        with self.assertRaises(RuntimeError):
+            seq.backward([0.0])
+        with self.assertRaises(RuntimeError):
+            seq.backward_with_initial_hidden([0.0], GH)
+        # The session is still open and finishes normally.
+        self.assertEqual(len(seq.finish_stream()), 1)
+        self.assertEqual(len(seq.backward([0.0])), 1)
+
+    def test_invalid_start_arguments_raise_and_change_nothing(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2)
+        seq.backward(GO)
+        snapshot = (seq.hidden, list(seq.outputs), list(seq.linear.last),
+                    list(seq.linear.grad), seq.linear.grad_bias)
+        for kwargs in ({"truncate": 0}, {"truncate": -1}, {"truncate": 1.5},
+                       {"truncate": True}, {"carry_hidden": 1},
+                       {"carry_hidden": None}, {"initial_hidden": True},
+                       {"initial_hidden": "0.0"}):
+            with self.assertRaises(ValueError):
+                seq.start_stream(**kwargs)
+            self.assertEqual(
+                (seq.hidden, list(seq.outputs), list(seq.linear.last),
+                 list(seq.linear.grad), seq.linear.grad_bias), snapshot)
+        # No session was opened by the rejected calls; the cache still works.
+        self.assertEqual(len(seq.backward(GO)), len(ROWS))
+        with self.assertRaises(RuntimeError):
+            seq.finish_stream()
+
+    def test_invalid_row_mid_session_changes_nothing_and_session_continues(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        seq.step([XS[0]])
+        hidden_before = seq.hidden
+        last_before = list(seq.linear.last)
+        for bad_row in ([], [1.0, 2.0], ["x"], [True], 7, "ab"):
+            with self.assertRaises(ValueError):
+                seq.step(bad_row)
+        self.assertEqual(seq.hidden, hidden_before)
+        self.assertEqual(seq.outputs, [hidden_before])
+        self.assertEqual(seq.linear.last, last_before)
+        # The session is still alive and completes the same trajectory.
+        for x in XS[1:]:
+            seq.step([x])
+        returned = seq.finish_stream()
+        self.assertTrue(allclose(
+            returned, sequence_outputs(W, B, XS, H0, 2, True), atol=1e-15))
+
+    def test_step_without_session_keeps_immediate_behavior(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS)
+        seq.step([0.2])
+        with self.assertRaises(RuntimeError):
+            seq.backward(GO)
+        self.assertTrue(close(seq.outputs[-1],
+                              math.tanh(W[0] * 0.2 + W[1] * sequence_outputs(
+                                  W, B, XS, 0.0, None, False)[-1] + B), atol=1e-15))
+
+    def test_reset_abandons_open_session(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0)
+        seq.step([XS[0]])
+        seq.reset()
+        self.assertEqual(seq.hidden, 0.0)
+        self.assertEqual(seq.outputs, [])
+        with self.assertRaises(RuntimeError):
+            seq.finish_stream()
+        with self.assertRaises(RuntimeError):
+            seq.backward(GO)
+
+
 class TanhSequenceConstructionTest(unittest.TestCase):
     def test_requires_two_weight_linear(self):
         with self.assertRaises(ValueError):

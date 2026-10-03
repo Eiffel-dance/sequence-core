@@ -125,6 +125,8 @@ class TanhSequence:
         self.hidden = 0.0
         self.outputs = []
         self._fwd = None
+        # Active stream session record, or None when no session is open.
+        self._stream = None
 
     def reset(self):
         self.hidden = 0.0
@@ -133,12 +135,17 @@ class TanhSequence:
         # the wrapped Linear's parameters, accumulated gradients, and its own
         # last-forward record completely untouched.
         self._fwd = None
+        # Any half-finished stream session is abandoned as well.
+        self._stream = None
 
     def step(self, row):
         # Validate before any state is touched, so a rejected row changes
         # neither hidden/outputs nor the Linear's last-forward record, and a
         # batch forward cache stays available for backward().
         x = _read_row(row)
+        stream = self._stream
+        if stream is not None:
+            return self._stream_step(stream, x)
         # Compute into a local first; only commit once the Linear forward and
         # the tanh succeeded.
         new_hidden = math.tanh(self.linear.forward([x, self.hidden]))
@@ -148,6 +155,94 @@ class TanhSequence:
         # pass, so that cache can no longer be back-propagated safely.
         self._fwd = None
         return new_hidden
+
+    def _stream_step(self, stream, x):
+        # One step inside an active stream session. The row is already
+        # validated; the step follows the same segment-boundary rules as the
+        # batch traversal so the recorded trajectory back-propagates with the
+        # shared formulas once finish_stream commits it.
+        i = len(stream["inputs"])
+        truncate = stream["truncate"]
+        if truncate is not None and i % truncate == 0:
+            # Segment start. The first segment starts from the session's
+            # initial hidden state; without carry every later segment resets
+            # to zero; with carry it starts from a numeric copy of the
+            # previous segment's last hidden value. That copy is detached: it
+            # enters this step's local derivatives but no gradient crosses
+            # back over the boundary.
+            if i == 0:
+                hidden = stream["initial_hidden"]
+            elif stream["carry_hidden"]:
+                hidden = float(stream["outputs"][-1])
+            else:
+                hidden = 0.0
+            stream["boundaries"].add(i)
+        else:
+            hidden = self.hidden
+        new_hidden = math.tanh(self.linear.forward([x, hidden]))
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
+        stream["inputs"].append(x)
+        stream["prev_hiddens"].append(hidden)
+        stream["outputs"].append(new_hidden)
+        return new_hidden
+
+    def start_stream(self, initial_hidden=None, truncate=None, carry_hidden=False):
+        # Same validation rules as the batch forward, applied before any
+        # state, cache, or Linear record is touched, so a rejected argument
+        # changes nothing.
+        if truncate is not None:
+            if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
+                raise ValueError("truncate must be a positive integer or None")
+        if not isinstance(carry_hidden, bool):
+            raise ValueError("carry_hidden must be a boolean")
+        if initial_hidden is None:
+            initial_hidden = 0.0
+        else:
+            initial_hidden = _read_number(initial_hidden, "initial_hidden")
+        if self._stream is not None:
+            raise RuntimeError(
+                "a stream session is already active; call finish_stream first")
+        # Opening a session invalidates any previously recorded backward
+        # cache and starts a fresh output trajectory from the given initial
+        # hidden state. The Linear's parameters, accumulated gradients, and
+        # last-forward record are left untouched.
+        self.hidden = initial_hidden
+        self.outputs = []
+        self._fwd = None
+        self._stream = {
+            "inputs": [],
+            "prev_hiddens": [],
+            "outputs": [],
+            "boundaries": set(),
+            "truncate": truncate,
+            "carry_hidden": carry_hidden,
+            "initial_hidden": initial_hidden,
+            # Parameter state as of the session's forward traversal; a later
+            # apply_gradients() must not affect backward() of this session.
+            "weights": list(self.linear.weight),
+        }
+        return None
+
+    def finish_stream(self):
+        stream = self._stream
+        if stream is None:
+            raise RuntimeError(
+                "finish_stream requires an active session; call start_stream first")
+        # Commit the recorded trajectory as the cached forward pass, in the
+        # same shape the batch traversal produces, so backward() and
+        # backward_with_initial_hidden() reuse the existing formulas.
+        self._fwd = {
+            "inputs": stream["inputs"],
+            "prev_hiddens": stream["prev_hiddens"],
+            "outputs": stream["outputs"],
+            "boundaries": stream["boundaries"],
+            "truncate": stream["truncate"],
+            "carry_hidden": stream["carry_hidden"],
+            "weights": stream["weights"],
+        }
+        self._stream = None
+        return list(stream["outputs"])
 
     def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None):
         if truncate is not None:
@@ -176,6 +271,7 @@ class TanhSequence:
         saved_hidden = self.hidden
         saved_outputs = self.outputs
         saved_fwd = self._fwd
+        saved_stream = self._stream
         saved_last = self.linear.last
         saved_last_weight = self.linear._last_weight
         saved_grad = list(self.linear.grad)
@@ -219,6 +315,7 @@ class TanhSequence:
             self.hidden = saved_hidden
             self.outputs = saved_outputs
             self._fwd = saved_fwd
+            self._stream = saved_stream
             self.linear.last = saved_last
             self.linear._last_weight = saved_last_weight
             self.linear.grad = saved_grad
@@ -227,6 +324,9 @@ class TanhSequence:
 
         self.hidden = hidden
         self.outputs = outputs
+        # A successful batch traversal supersedes any half-finished stream
+        # session; a failed one restored it above.
+        self._stream = None
         # Cache of this forward pass for backward(). Only committed once the
         # whole traversal succeeded, so an illegal row leaves any earlier
         # successful record intact.
@@ -254,6 +354,9 @@ class TanhSequence:
         return self._backward(grad_outputs, grad_hidden, return_initial=True)
 
     def _backward(self, grad_outputs, grad_hidden, return_initial):
+        if self._stream is not None:
+            raise RuntimeError(
+                "backward requires the stream session to be finished first")
         if self._fwd is None:
             raise RuntimeError("backward requires a cached forward pass; call forward first")
 
