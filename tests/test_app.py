@@ -760,6 +760,240 @@ def _inputs_only(weight, bias, rows, truncate, carry, h0, go):
     return seq.backward(go)
 
 
+def _outputs_with_boundary_values(weight, bias, xs, h0, boundary_set, values):
+    """Scalar reference traversal whose segment starts are exactly
+    ``boundary_set``; every start other than 0 reads a frozen constant from
+    ``values`` (detached, exactly as the published boundary semantics)."""
+    outs = []
+    hidden = h0
+    for i, x in enumerate(xs):
+        if i in boundary_set:
+            hidden = h0 if i == 0 else values[i]
+        hidden = math.tanh(weight[0] * x + weight[1] * hidden + bias)
+        outs.append(hidden)
+    return outs
+
+
+class BoundaryGradientTest(unittest.TestCase):
+    def _boundary_values(self, outs, boundary_set, carry):
+        return {i: (outs[i - 1] if carry else 0.0)
+                for i in boundary_set if i > 0}
+
+    def _check_boundary_finite_differences(self, xs, truncate, carry, h0,
+                                           go, gh, declared=None):
+        """Every reported boundary gradient must equal the central finite
+        difference of the loss with respect to that start's frozen hidden
+        constant, with all other boundary constants held fixed."""
+        seq = fresh_sequence(W, B)
+        outs = seq.forward([[x] for x in xs], truncate, carry, h0,
+                           segment_starts=declared)
+        input_grads, grad_initial, boundary_grads = \
+            seq.backward_with_boundaries(go, gh)
+
+        if truncate is not None:
+            boundary_set = {i for i in range(len(xs)) if i % truncate == 0}
+        else:
+            boundary_set = {0}
+        if declared is not None:
+            boundary_set |= {i for i, flag in enumerate(declared) if flag}
+        expected_indices = sorted(i for i in boundary_set if i > 0)
+        self.assertEqual([i for i, _ in boundary_grads], expected_indices)
+
+        values = self._boundary_values(outs, boundary_set, carry)
+
+        def loss(perturbed):
+            traj = _outputs_with_boundary_values(
+                W, B, xs, h0, boundary_set, perturbed)
+            return (sum(g * o for g, o in zip(go, traj)) + gh * traj[-1]
+                    if traj else gh * h0)
+
+        for index, gradient in boundary_grads:
+            fd = central(lambda d, index=index: loss(
+                {**values, index: values[index] + d}))
+            self.assertTrue(close(gradient, fd),
+                            "boundary grad i=%d: analytic %r fd %r"
+                            % (index, gradient, fd))
+        return seq, input_grads, grad_initial, boundary_grads
+
+    def test_first_two_returns_match_seeded_entry(self):
+        for truncate, carry, h0, gh in (
+                (None, False, 0.0, 0.0), (2, False, 0.0, GH),
+                (2, True, H0, GH), (3, True, 0.0, GH), (1, True, H0, GH)):
+            seeded = fresh_sequence(W, B)
+            seeded.forward(ROWS, truncate, carry, h0)
+            ref_inputs, ref_initial = seeded.backward_with_initial_hidden(GO, gh)
+            bounded = fresh_sequence(W, B)
+            bounded.forward(ROWS, truncate, carry, h0)
+            input_grads, grad_initial, _ = \
+                bounded.backward_with_boundaries(GO, gh)
+            self.assertTrue(allclose(input_grads, ref_inputs, atol=1e-15))
+            self.assertTrue(close(grad_initial, ref_initial, atol=1e-15))
+
+    def test_boundary_gradients_match_finite_differences(self):
+        self._check_boundary_finite_differences(XS, 2, True, H0, GO, GH)
+        self._check_boundary_finite_differences(XS, 2, False, 0.0, GO, GH)
+        self._check_boundary_finite_differences(XS, 3, True, 0.0, GO, 0.0)
+        self._check_boundary_finite_differences(XS, 1, True, H0, GO, GH)
+        self._check_boundary_finite_differences(XS, 1, False, H0, GO, GH)
+        self._check_boundary_finite_differences(XS[:4], 2, True, H0, GO[:4], 0.0)
+
+    def test_truncate_and_segment_starts_merge_and_dedup(self):
+        # truncate=2 yields starts 0,2,4; declarations add 3 and repeat 2.
+        declared = [False, False, True, True, False]
+        _, _, _, boundary_grads = self._check_boundary_finite_differences(
+            XS, 2, True, H0, GO, GH, declared=declared)
+        self.assertEqual([i for i, _ in boundary_grads], [2, 3, 4])
+
+    def test_explicit_segment_starts_without_truncate(self):
+        declared = [False, True, False, True, False]
+        _, _, _, boundary_grads = self._check_boundary_finite_differences(
+            XS, None, False, H0, GO, GH, declared=declared)
+        self.assertEqual([i for i, _ in boundary_grads], [1, 3])
+        # With carry the constants are the prior segment ends.
+        _, _, _, carried = self._check_boundary_finite_differences(
+            XS, None, True, H0, GO, GH, declared=declared)
+        self.assertEqual([i for i, _ in carried], [1, 3])
+
+    def test_no_nonzero_index_boundaries_returns_empty_list(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, initial_hidden=H0)
+        _, _, boundary_grads = seq.backward_with_boundaries(GO, GH)
+        self.assertEqual(boundary_grads, [])
+        # truncate longer than the sequence only has the index-zero start.
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=100, carry_hidden=True, initial_hidden=H0)
+        _, _, boundary_grads = seq.backward_with_boundaries(GO, GH)
+        self.assertEqual(boundary_grads, [])
+        # Single step: only start 0 exists.
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS[:1], truncate=1, carry_hidden=True, initial_hidden=H0)
+        _, _, boundary_grads = seq.backward_with_boundaries(GO[:1], GH)
+        self.assertEqual(boundary_grads, [])
+
+    def test_empty_sequence_returns_empty_inputs_passthrough_seed(self):
+        seq = fresh_sequence(W, B)
+        seq.forward([], truncate=2, carry_hidden=True, initial_hidden=H0)
+        input_grads, grad_initial, boundary_grads = \
+            seq.backward_with_boundaries([], GH)
+        self.assertEqual(input_grads, [])
+        self.assertTrue(close(grad_initial, GH, atol=1e-15))
+        self.assertEqual(boundary_grads, [])
+        self.assertEqual(seq.linear.grad, [0.0, 0.0])
+        self.assertEqual(seq.linear.grad_bias, 0.0)
+
+    def test_stream_cache_reports_same_boundaries(self):
+        streamed = fresh_sequence(W, B)
+        streamed.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for x in XS:
+            streamed.step([x])
+        streamed.finish_stream()
+        s_inputs, s_initial, s_boundaries = \
+            streamed.backward_with_boundaries(GO, GH)
+
+        batched = fresh_sequence(W, B)
+        batched.forward(ROWS, 2, True, H0)
+        b_inputs, b_initial, b_boundaries = \
+            batched.backward_with_boundaries(GO, GH)
+        self.assertTrue(allclose(s_inputs, b_inputs, atol=1e-15))
+        self.assertTrue(close(s_initial, b_initial, atol=1e-15))
+        self.assertEqual(len(s_boundaries), len(b_boundaries))
+        for (si, sg), (bi, bg) in zip(s_boundaries, b_boundaries):
+            self.assertEqual(si, bi)
+            self.assertTrue(close(sg, bg, atol=1e-15))
+
+    def test_repeated_calls_accumulate_like_merged_upstream(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        _, _, first_boundaries = seq.backward_with_boundaries(GO, GH)
+        go2 = [0.11 * (t + 1) for t in range(len(XS))]
+        gh2 = -0.4
+        _, _, second_boundaries = seq.backward_with_boundaries(go2, gh2)
+
+        merged = fresh_sequence(W, B)
+        merged.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        _, _, merged_boundaries = merged.backward_with_boundaries(
+            [a + b for a, b in zip(GO, go2)], GH + gh2)
+        self.assertTrue(allclose(seq.linear.grad, merged.linear.grad))
+        self.assertTrue(close(seq.linear.grad_bias, merged.linear.grad_bias))
+
+        totals = {}
+        for boundaries in (first_boundaries, second_boundaries):
+            for index, gradient in boundaries:
+                totals[index] = totals.get(index, 0.0) + gradient
+        self.assertEqual(sorted(totals),
+                         [i for i, _ in merged_boundaries])
+        for index, gradient in merged_boundaries:
+            self.assertTrue(close(totals[index], gradient))
+
+    def test_multi_feature_boundary_gradients(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        outs = seq.forward(ROWSM, truncate=2, carry_hidden=True,
+                           initial_hidden=H0)
+        input_grads, grad_initial, boundary_grads = \
+            seq.backward_with_boundaries(GOM, GH)
+        self.assertEqual([i for i, _ in boundary_grads], [2, 4])
+        for row_grads in input_grads:
+            self.assertIsInstance(row_grads, list)
+            self.assertEqual(len(row_grads), 2)
+
+        d = len(WM) - 1
+
+        def loss(values):
+            traj = []
+            hidden = H0
+            for i, row in enumerate(ROWSM):
+                if i % 2 == 0:
+                    hidden = H0 if i == 0 else values[i]
+                pre = sum(WM[k] * row[k] for k in range(d)) + WM[d] * hidden + BM
+                hidden = math.tanh(pre)
+                traj.append(hidden)
+            return sum(g * o for g, o in zip(GOM, traj)) + GH * traj[-1]
+
+        values = {2: outs[1], 4: outs[3]}
+        for index, gradient in boundary_grads:
+            fd = central(lambda dd, index=index: loss(
+                {**values, index: values[index] + dd}))
+            self.assertTrue(close(gradient, fd))
+
+        twin = TanhSequence(Linear(list(WM), BM))
+        twin.forward(ROWSM, 2, True, H0)
+        ref_inputs, ref_initial = twin.backward_with_initial_hidden(GOM, GH)
+        for a, b in zip(input_grads, ref_inputs):
+            self.assertTrue(allclose(a, b, atol=1e-15))
+        self.assertTrue(close(grad_initial, ref_initial, atol=1e-15))
+
+    def test_validation_and_state_rules_match_seeded_entry(self):
+        seq = fresh_sequence(W, B)
+        with self.assertRaises(RuntimeError):
+            seq.backward_with_boundaries(GO)
+        seq.forward(ROWS, truncate=2)
+        seq.backward(GO)
+        snapshot = (list(seq.linear.grad), seq.linear.grad_bias)
+        for bad in ([0.0] * 4, [0.0] * 6, [], [1.0, "x", 0.0, 0.0, 0.0],
+                    [True, 0.0, 0.0, 0.0, 0.0], "00000", object()):
+            with self.assertRaises(ValueError):
+                seq.backward_with_boundaries(bad, GH)
+        for bad_seed in (True, "0.0", None):
+            with self.assertRaises(ValueError):
+                seq.backward_with_boundaries(GO, bad_seed)
+        self.assertEqual(seq.linear.grad, snapshot[0])
+        self.assertEqual(seq.linear.grad_bias, snapshot[1])
+        # Cache still fully usable after every rejected call.
+        self.assertEqual(
+            len(seq.backward_with_boundaries(GO)[0]), len(ROWS))
+
+    def test_open_session_raises_runtime_error(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(truncate=2)
+        seq.step([XS[0]])
+        with self.assertRaises(RuntimeError):
+            seq.backward_with_boundaries([0.0])
+        # The session remains open and the finished cache works normally.
+        self.assertEqual(len(seq.finish_stream()), 1)
+        _, _, boundary_grads = seq.backward_with_boundaries([0.0])
+        self.assertEqual(boundary_grads, [])
+
+
 class StreamSessionTest(unittest.TestCase):
     def _run_stream(self, xs, truncate=None, carry=False, h0=None):
         seq = fresh_sequence(W, B)

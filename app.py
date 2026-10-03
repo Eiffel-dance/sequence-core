@@ -408,7 +408,19 @@ class TanhSequence:
         # gradient with respect to that forward's initial_hidden as well.
         return self._backward(grad_outputs, grad_hidden, return_initial=True)
 
-    def _backward(self, grad_outputs, grad_hidden, return_initial):
+    def backward_with_boundaries(self, grad_outputs, grad_hidden=0.0):
+        # Like backward_with_initial_hidden (the first two returned values are
+        # computed by the exact same traversal), but additionally reports the
+        # total hidden-state gradient received at every actual segment start
+        # whose index is greater than zero. truncate-produced boundaries and
+        # segment_starts-declared boundaries are already merged in the cache;
+        # the index-zero boundary is reported only as grad_initial_hidden.
+        return self._backward(
+            grad_outputs, grad_hidden,
+            return_initial=True, return_boundaries=True)
+
+    def _backward(self, grad_outputs, grad_hidden, return_initial,
+                  return_boundaries=False):
         if self._stream is not None:
             raise RuntimeError(
                 "backward requires the stream session to be finished first")
@@ -434,6 +446,9 @@ class TanhSequence:
         grad_hidden = _read_number(grad_hidden, "grad_hidden")
 
         input_grads = [0.0] * n
+        # Collected in reverse traversal order, then returned ascending by
+        # index. Only populated when boundary reporting was requested.
+        boundary_grads_rev = []
 
         # The terminal hidden-state gradient seeds the recurrence at the last
         # step, where it is added to that step's output gradient. A zero seed
@@ -471,12 +486,22 @@ class TanhSequence:
                 grad_initial_hidden = d_pre * w_hidden
             if t in boundaries:
                 # Truncated BPTT: segment-start hidden values (zeroed or
-                # carried as detached numbers) are constants, so no gradient
-                # crosses back into the prior segment.
+                # carried as detached numeric copies) are constants, so no
+                # gradient crosses back into the prior segment. The gradient
+                # the cut would have carried across is the gradient with
+                # respect to this segment's starting hidden value; record it
+                # before severing (the index-zero start is reported
+                # separately as grad_initial_hidden), then reset to zero.
+                incoming_hidden_grad = d_pre * w_hidden
+                if return_boundaries and t > 0:
+                    boundary_grads_rev.append((t, incoming_hidden_grad))
                 hidden_grad = 0.0
             else:
                 hidden_grad = d_pre * w_hidden
 
+        if return_boundaries:
+            boundary_grads = list(reversed(boundary_grads_rev))
+            return input_grads, grad_initial_hidden, boundary_grads
         if return_initial:
             return input_grads, grad_initial_hidden
         return input_grads
