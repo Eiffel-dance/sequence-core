@@ -760,6 +760,231 @@ def _inputs_only(weight, bias, rows, truncate, carry, h0, go):
     return seq.backward(go)
 
 
+# ---------------------------------------------------------------------------
+# Multi-feature (d > 1) reference formulas. Same published recurrence, but the
+# linear combination runs over d input features plus the hidden state.
+# ---------------------------------------------------------------------------
+
+# A 3-feature sample: weight = [w0, w1, w2, w_hidden].
+WM = [0.4, -0.2, 0.3, -0.3]
+BM = 0.15
+ROWSM = [[0.8, -0.1, 0.5], [-0.5, 0.9, 0.0], [1.2, 0.3, -0.4],
+         [-0.7, 0.2, 1.1], [0.3, -0.6, 0.7]]
+
+
+def sequence_outputs_multi(weight, bias, rows, h0, truncate, carry, frozen=None):
+    """tanh(sum_k w_k*x_k + w_h*h_prev + b) over length-d rows."""
+    d = len(weight) - 1
+    outs = []
+    hidden = h0
+    for i, row in enumerate(rows):
+        if truncate is not None and i % truncate == 0:
+            if i == 0:
+                hidden = h0
+            elif frozen is not None:
+                hidden = frozen[i]
+            elif carry:
+                hidden = outs[-1]
+            else:
+                hidden = 0.0
+        pre = sum(weight[k] * row[k] for k in range(d)) + weight[d] * hidden + bias
+        hidden = math.tanh(pre)
+        outs.append(hidden)
+    return outs
+
+
+def frozen_boundaries_multi(rows, truncate, carry, weight, bias, h0):
+    if truncate is None:
+        return {}
+    base = sequence_outputs_multi(weight, bias, rows, h0, truncate, carry)
+    frozen = {}
+    for i in range(1, len(rows)):
+        if i % truncate == 0:
+            frozen[i] = base[i - 1] if carry else 0.0
+    return frozen
+
+
+def objective_multi(weight, bias, rows, h0, grad_outputs, grad_hidden,
+                    truncate, carry, frozen):
+    outs = sequence_outputs_multi(weight, bias, rows, h0, truncate, carry, frozen)
+    if not outs:
+        return grad_hidden * h0
+    return sum(g * o for g, o in zip(grad_outputs, outs)) + grad_hidden * outs[-1]
+
+
+class MultiFeatureForwardTest(unittest.TestCase):
+    def _check_trajectory(self, rows, truncate, carry, h0):
+        seq = TanhSequence(Linear(list(WM), BM))
+        outs = seq.forward(rows, truncate, carry, h0)
+        expected = sequence_outputs_multi(WM, BM, rows, h0, truncate, carry)
+        self.assertTrue(allclose(outs, expected, atol=1e-12))
+        if rows:
+            self.assertTrue(close(seq.hidden, expected[-1], atol=1e-12))
+        else:
+            self.assertTrue(close(seq.hidden, h0, atol=1e-15))
+        self.assertEqual(seq.outputs, outs)
+
+    def test_trajectories(self):
+        for truncate, carry in ((None, False), (1, False), (1, True),
+                                (2, False), (2, True), (3, True), (100, False)):
+            for h0 in (0.0, H0):
+                self._check_trajectory(ROWSM, truncate, carry, h0)
+        self._check_trajectory([], 2, True, H0)
+        self._check_trajectory(ROWSM[:1], None, False, H0)
+
+    def test_step_and_stream_match_batch(self):
+        # Plain step() has no truncation schedule, so it only mirrors the
+        # untruncated batch; stream sessions mirror every schedule.
+        expected_plain = sequence_outputs_multi(WM, BM, ROWSM, H0, None, False)
+        stepped = TanhSequence(Linear(list(WM), BM))
+        stepped.forward([], initial_hidden=H0)
+        step_outs = [stepped.step(list(row)) for row in ROWSM]
+        self.assertTrue(allclose(step_outs, expected_plain, atol=1e-15))
+
+        for truncate, carry in ((None, False), (2, True), (2, False)):
+            expected = sequence_outputs_multi(WM, BM, ROWSM, H0, truncate, carry)
+            streamed = TanhSequence(Linear(list(WM), BM))
+            streamed.start_stream(initial_hidden=H0, truncate=truncate,
+                                  carry_hidden=carry)
+            stream_outs = [streamed.step(list(row)) for row in ROWSM]
+            returned = streamed.finish_stream()
+            self.assertTrue(allclose(stream_outs, expected, atol=1e-15))
+            self.assertTrue(allclose(returned, expected, atol=1e-15))
+
+    def test_row_validation_and_rollback(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward(ROWSM, truncate=2)
+        seq.backward(GO)
+        snapshot = (seq.hidden, list(seq.outputs), list(seq.linear.last),
+                    list(seq.linear.grad), seq.linear.grad_bias)
+        bad_rows = ([[0.1, 0.2]],            # too narrow
+                    [[0.1, 0.2, 0.3, 0.4]],  # too wide
+                    [[0.1, 0.2], [0.1]],     # bad width mid-traversal
+                    [[0.1, "x", 0.3]],       # non-number element
+                    [[0.1, True, 0.3]],      # bool element
+                    [[0.1, None, 0.3]],
+                    ["abc"] * 3,             # text rows
+                    [[0.1, 0.2, 0.3], 7])    # non-sequence row
+        for bad in bad_rows:
+            with self.assertRaises(ValueError):
+                seq.forward(bad, truncate=2)
+            self.assertEqual((seq.hidden, list(seq.outputs),
+                              list(seq.linear.last), list(seq.linear.grad),
+                              seq.linear.grad_bias), snapshot)
+        for bad_row in ([0.1, 0.2], [0.1, 0.2, 0.3, 0.4], [0.1, "x", 0.3],
+                        [0.1, True, 0.3], "abc", 7):
+            with self.assertRaises(ValueError):
+                seq.step(bad_row)
+            self.assertEqual((seq.hidden, list(seq.outputs),
+                              list(seq.linear.last), list(seq.linear.grad),
+                              seq.linear.grad_bias), snapshot)
+        # The pre-error cache still back-propagates.
+        self.assertEqual(len(seq.backward(GO)), len(ROWSM))
+
+
+class MultiFeatureBackwardTest(unittest.TestCase):
+    def _run_gradient_case(self, rows, truncate, carry, h0, grad_hidden):
+        go = GO[:len(rows)]
+        frozen = frozen_boundaries_multi(rows, truncate, carry, WM, BM, h0)
+
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward(rows, truncate, carry, h0)
+        input_grads, grad_initial = seq.backward_with_initial_hidden(go, grad_hidden)
+
+        # Input gradients mirror the input shape: one length-d row per step.
+        self.assertEqual(len(input_grads), len(rows))
+        for row_grads in input_grads:
+            self.assertEqual(len(row_grads), 3)
+
+        def obj(weight, bias, inputs, initial):
+            return objective_multi(weight, bias, inputs, initial, go,
+                                   grad_hidden, truncate, carry, frozen)
+
+        for t in range(len(rows)):
+            for k in range(3):
+                def perturbed(d, t=t, k=k):
+                    rows_d = [list(r) for r in rows]
+                    rows_d[t][k] += d
+                    return obj(WM, BM, rows_d, h0)
+                fd = central(perturbed)
+                self.assertTrue(close(input_grads[t][k], fd),
+                                "input grad t=%d k=%d: %r vs %r"
+                                % (t, k, input_grads[t][k], fd))
+        for k in range(4):
+            fd = central(lambda d, k=k: obj(
+                [w + (d if j == k else 0.0) for j, w in enumerate(WM)],
+                BM, rows, h0))
+            self.assertTrue(close(seq.linear.grad[k], fd),
+                            "weight grad %d: %r vs %r" % (k, seq.linear.grad[k], fd))
+        self.assertTrue(close(seq.linear.grad_bias,
+                              central(lambda d: obj(WM, BM + d, rows, h0))))
+        self.assertTrue(close(grad_initial,
+                              central(lambda d: obj(WM, BM, rows, h0 + d))))
+
+    def test_gradients(self):
+        self._run_gradient_case(ROWSM, None, False, 0.0, 0.0)
+        self._run_gradient_case(ROWSM, None, False, H0, GH)
+        self._run_gradient_case(ROWSM, 1, True, H0, GH)
+        self._run_gradient_case(ROWSM, 2, False, 0.0, GH)
+        self._run_gradient_case(ROWSM, 2, True, H0, GH)
+        self._run_gradient_case(ROWSM, 100, False, H0, GH)
+        self._run_gradient_case(ROWSM[:1], None, False, H0, GH)
+
+    def test_stream_gradients_match_batch(self):
+        go = GO
+        streamed = TanhSequence(Linear(list(WM), BM))
+        streamed.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for row in ROWSM:
+            streamed.step(list(row))
+        streamed.finish_stream()
+        stream_inputs, stream_initial = streamed.backward_with_initial_hidden(go, GH)
+
+        ref = TanhSequence(Linear(list(WM), BM))
+        ref.forward(ROWSM, 2, True, H0)
+        ref_inputs, ref_initial = ref.backward_with_initial_hidden(go, GH)
+        for s_row, r_row in zip(stream_inputs, ref_inputs):
+            self.assertTrue(allclose(s_row, r_row, atol=1e-15))
+        self.assertTrue(close(stream_initial, ref_initial, atol=1e-15))
+        self.assertTrue(allclose(streamed.linear.grad, ref.linear.grad, atol=1e-15))
+        self.assertTrue(close(streamed.linear.grad_bias, ref.linear.grad_bias, atol=1e-15))
+
+    def test_plain_backward_returns_nested_rows(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward(ROWSM, 2, True, H0)
+        input_grads = seq.backward(GO)
+        self.assertEqual(len(input_grads), len(ROWSM))
+        self.assertTrue(all(isinstance(r, list) and len(r) == 3
+                            for r in input_grads))
+
+    def test_empty_sequence(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward([], truncate=2, carry_hidden=True, initial_hidden=H0)
+        input_grads, grad_initial = seq.backward_with_initial_hidden([], GH)
+        self.assertEqual(input_grads, [])
+        self.assertTrue(close(grad_initial, GH, atol=1e-15))
+        self.assertEqual(seq.linear.grad, [0.0] * 4)
+        self.assertEqual(seq.linear.grad_bias, 0.0)
+
+    def test_repeated_backward_accumulates_into_same_linear(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward(ROWSM, 2, True, H0)
+        seq.backward(GO)
+        seq.backward(GO)
+        ref = TanhSequence(Linear(list(WM), BM))
+        ref.forward(ROWSM, 2, True, H0)
+        ref.backward([2 * g for g in GO])
+        self.assertTrue(allclose(seq.linear.grad, ref.linear.grad))
+        self.assertTrue(close(seq.linear.grad_bias, ref.linear.grad_bias))
+
+    def test_single_feature_keeps_flat_gradient_list(self):
+        # d == 1 compatibility: flat scalar list, identical numerics.
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, 2, True, H0)
+        input_grads = seq.backward(GO)
+        self.assertTrue(all(isinstance(g, float) for g in input_grads))
+        self.assertEqual(len(input_grads), len(ROWS))
+
+
 class StreamSessionTest(unittest.TestCase):
     def _run_stream(self, xs, truncate=None, carry=False, h0=None):
         seq = fresh_sequence(W, B)
@@ -1026,19 +1251,22 @@ class StreamSessionTest(unittest.TestCase):
 
 
 class TanhSequenceConstructionTest(unittest.TestCase):
-    def test_requires_two_weight_linear(self):
+    def test_requires_at_least_two_weight_linear(self):
         with self.assertRaises(ValueError):
             TanhSequence(Linear([0.5]))
-        with self.assertRaises(ValueError):
-            TanhSequence(Linear([0.5, 0.1, 0.2]))
         with self.assertRaises(ValueError):
             TanhSequence("not a linear")
         with self.assertRaises(ValueError):
             TanhSequence(object())
 
+    def test_accepts_two_or_more_weights(self):
+        for width in (2, 3, 5):
+            seq = TanhSequence(Linear([0.1] * width, 0.2))
+            self.assertEqual(seq.d, width - 1)
+
     def test_rejected_construction_leaves_linear_untouched(self):
-        lin = Linear([0.5, 0.1, 0.2], 0.3)
-        lin.forward([1.0, 2.0, 3.0])
+        lin = Linear([0.5], 0.3)
+        lin.forward([1.0])
         lin.backward(0.4)
         weight, grads, grad_bias, last = (
             list(lin.weight), list(lin.grad), lin.grad_bias, list(lin.last))

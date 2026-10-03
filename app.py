@@ -28,20 +28,24 @@ def _read_number_sequence(values, expected_length, what):
     return result
 
 
-def _read_row(row):
-    """Validate a single-element numeric sequence and return its value."""
+def _read_row(row, width):
+    """Validate one input row and return it as a list of ``width`` numbers."""
     if isinstance(row, (str, bytes, bytearray, memoryview)):
-        raise ValueError("each input row must be a single-element numeric sequence")
+        raise ValueError("each input row must be a non-text, non-bytes sequence of numbers")
     try:
         length = len(row)
     except TypeError:
-        raise ValueError("each input row must be a single-element numeric sequence")
-    if length != 1:
-        raise ValueError("each input row must contain exactly one numeric value")
-    value = row[0]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError("the input value must be a number")
-    return value
+        raise ValueError("each input row must be a sequence of numbers")
+    if length != width:
+        raise ValueError(
+            "each input row must contain exactly %d numeric value(s); got %d"
+            % (width, length))
+    values = []
+    for value in row:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("each input value must be a Python int or float")
+        values.append(value)
+    return values
 
 
 def _read_grad_list(values, expected_length):
@@ -113,15 +117,18 @@ class Linear:
 
 class TanhSequence:
     def __init__(self, linear):
-        # Only a Linear with exactly two weights (one input weight, one
-        # recurrent weight) is supported. Rejected immediately, without
-        # touching the passed layer's parameters, gradients, or last-forward
-        # record.
+        # Only a Linear with at least two weights is supported: the first
+        # d = len(weight) - 1 weights are the input-feature coefficients and
+        # the last weight is the recurrent hidden-state coefficient. Rejected
+        # immediately, without touching the passed layer's parameters,
+        # gradients, or last-forward record.
         if not isinstance(linear, Linear):
-            raise ValueError("TanhSequence requires a Linear with exactly two weights")
-        if len(linear.weight) != 2:
-            raise ValueError("TanhSequence requires a Linear with exactly two weights")
+            raise ValueError("TanhSequence requires a Linear with at least two weights")
+        if len(linear.weight) < 2:
+            raise ValueError("TanhSequence requires a Linear with at least two weights")
         self.linear = linear
+        # Input width d: every row carries exactly this many features.
+        self.d = len(linear.weight) - 1
         self.hidden = 0.0
         self.outputs = []
         self._fwd = None
@@ -142,13 +149,14 @@ class TanhSequence:
         # Validate before any state is touched, so a rejected row changes
         # neither hidden/outputs nor the Linear's last-forward record, and a
         # batch forward cache stays available for backward().
-        x = _read_row(row)
+        x = _read_row(row, self.d)
         stream = self._stream
         if stream is not None:
             return self._stream_step(stream, x)
         # Compute into a local first; only commit once the Linear forward and
-        # the tanh succeeded.
-        new_hidden = math.tanh(self.linear.forward([x, self.hidden]))
+        # the tanh succeeded. The Linear sees the d input features followed by
+        # the previous hidden state, matching its d+1 weights.
+        new_hidden = math.tanh(self.linear.forward(x + [self.hidden]))
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         # Continuing the trajectory stepwise mixes it with any recorded batch
@@ -179,7 +187,7 @@ class TanhSequence:
             stream["boundaries"].add(i)
         else:
             hidden = self.hidden
-        new_hidden = math.tanh(self.linear.forward([x, hidden]))
+        new_hidden = math.tanh(self.linear.forward(x + [hidden]))
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         stream["inputs"].append(x)
@@ -306,9 +314,9 @@ class TanhSequence:
                     else:
                         hidden = initial_hidden
                     boundaries.add(i)
-                x = _read_row(row)
+                x = _read_row(row, self.d)
                 prev_hiddens.append(hidden)
-                hidden = math.tanh(self.linear.forward([x, hidden]))
+                hidden = math.tanh(self.linear.forward(x + [hidden]))
                 inputs.append(x)
                 outputs.append(hidden)
         except (TypeError, ValueError):
@@ -364,8 +372,11 @@ class TanhSequence:
         prev_hiddens = self._fwd["prev_hiddens"]
         outputs = self._fwd["outputs"]
         boundaries = self._fwd["boundaries"]
-        w_input = self._fwd["weights"][0]
-        w_hidden = self._fwd["weights"][1]
+        # Forward-time weights: the first d are the input-feature
+        # coefficients, the last is the recurrent hidden coefficient.
+        weights = self._fwd["weights"]
+        d = len(weights) - 1
+        w_hidden = weights[d]
         n = len(outputs)
         # Validate every argument before any gradient is accumulated, so a
         # rejected call leaves both the cache and the Linear's accumulated
@@ -391,12 +402,22 @@ class TanhSequence:
 
             # Parameter gradients at this step are always accumulated,
             # including at segment starts (the detached carry value is treated
-            # as a constant and enters this local derivative only).
-            self.linear.grad[0] += d_pre * inputs[t]
-            self.linear.grad[1] += d_pre * prev_hiddens[t]
+            # as a constant and enters this local derivative only). The first
+            # d slots pair with the input features, the last with the
+            # previous hidden state.
+            row = inputs[t]
+            for k in range(d):
+                self.linear.grad[k] += d_pre * row[k]
+            self.linear.grad[d] += d_pre * prev_hiddens[t]
             self.linear.grad_bias += d_pre
 
-            input_grads[t] = d_pre * w_input
+            # Input gradients mirror the input shape: for d == 1 the
+            # historical flat list of scalars, otherwise one row of d
+            # gradients per step.
+            if d == 1:
+                input_grads[t] = d_pre * weights[0]
+            else:
+                input_grads[t] = [d_pre * weights[k] for k in range(d)]
             # Step 0 always consumes initial_hidden as its previous hidden
             # state. With truncation the boundary cut below severs later
             # segments, so this local term is the full gradient with respect
