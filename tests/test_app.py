@@ -279,6 +279,158 @@ class LinearBackwardTest(unittest.TestCase):
         self.assertEqual(self.lin.grad_bias, bias_grad_before)
 
 
+class LinearClipGradientsTest(unittest.TestCase):
+    WEIGHT = [0.3, -0.7, 0.5]
+    BIAS = 0.2
+
+    def setUp(self):
+        self.lin = Linear(list(self.WEIGHT), self.BIAS)
+
+    def seed_grads(self, grad, grad_bias):
+        self.lin.grad = list(grad)
+        self.lin.grad_bias = grad_bias
+
+    def snapshot(self):
+        return (list(self.lin.weight), self.lin.bias, list(self.lin.grad),
+                self.lin.grad_bias, self.lin.last)
+
+    def test_rejects_invalid_max_norm_and_changes_nothing(self):
+        self.lin.forward([0.4, -1.1, 0.9])
+        self.lin.backward(0.6)
+        before = self.snapshot()
+        for bad in (True, False, "1.0", None, -1.0, -0.5,
+                    float("nan"), float("inf"), -float("inf"), 10 ** 400):
+            with self.assertRaises(ValueError):
+                self.lin.clip_gradients(bad)
+            self.assertEqual(self.snapshot(), before)
+
+    def test_within_bound_returns_one_and_keeps_gradients(self):
+        self.seed_grads([0.3, -0.4, 0.0], 0.0)  # norm exactly 0.5
+        before = self.snapshot()
+        self.assertEqual(self.lin.clip_gradients(0.5), 1.0)
+        self.assertEqual(self.lin.clip_gradients(2), 1.0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_zero_norm_returns_one_even_against_zero_bound(self):
+        before = self.snapshot()
+        self.assertEqual(self.lin.clip_gradients(0), 1.0)
+        self.assertEqual(self.lin.clip_gradients(1.0), 1.0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_scales_to_bound_and_returns_ratio(self):
+        # grad and grad_bias form one vector: [3, 4, 0] with bias 12 -> norm 13.
+        self.seed_grads([3.0, 4.0, 0.0], 12.0)
+        ratio = self.lin.clip_gradients(6.5)
+        self.assertTrue(close(ratio, 0.5, atol=1e-15))
+        self.assertTrue(allclose(self.lin.grad, [1.5, 2.0, 0.0], atol=1e-15))
+        self.assertTrue(close(self.lin.grad_bias, 6.0, atol=1e-15))
+        # Parameters are untouched by clipping.
+        self.assertEqual(self.lin.weight, self.WEIGHT)
+        self.assertEqual(self.lin.bias, self.BIAS)
+
+    def test_zero_bound_zeroes_nonzero_gradient(self):
+        self.seed_grads([3.0, 4.0, -1.0], 12.0)
+        self.assertEqual(self.lin.clip_gradients(0), 0.0)
+        self.assertEqual(self.lin.grad, [0.0, 0.0, 0.0])
+        self.assertEqual(self.lin.grad_bias, 0.0)
+        # Clipping the now-zero gradient again reports nothing to do.
+        self.assertEqual(self.lin.clip_gradients(0), 1.0)
+
+    def test_repeated_clip_is_idempotent(self):
+        self.seed_grads([0.5, 0.0, 0.0], 0.0)
+        self.assertEqual(self.lin.clip_gradients(0.25), 0.5)
+        self.assertEqual(self.lin.grad, [0.25, 0.0, 0.0])
+        before = self.snapshot()
+        self.assertEqual(self.lin.clip_gradients(0.25), 1.0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_empty_gradient_vector_clips_bias_only(self):
+        lin = Linear([])
+        lin.grad_bias = 0.5
+        self.assertEqual(lin.clip_gradients(0.25), 0.5)
+        self.assertEqual(lin.grad, [])
+        self.assertEqual(lin.grad_bias, 0.25)
+        self.assertEqual(lin.clip_gradients(0.25), 1.0)
+
+    def test_finite_components_with_overflowing_squares(self):
+        # Each square overflows a double, but the true norm is finite.
+        self.seed_grads([1e308, 0.0, 0.0], 1e308)
+        norm = math.hypot(1e308, 1e308)
+        # Already within a bound above the norm: unchanged.
+        self.assertEqual(self.lin.clip_gradients(1.5e308), 1.0)
+        self.assertEqual(self.lin.grad, [1e308, 0.0, 0.0])
+        ratio = self.lin.clip_gradients(1e308)
+        self.assertTrue(close(ratio, 1e308 / norm, rtol=1e-12))
+        self.assertTrue(close(math.hypot(*(self.lin.grad + [self.lin.grad_bias])),
+                              1e308, rtol=1e-12))
+
+    def test_overflowing_norm_rejected_without_partial_write(self):
+        self.seed_grads([1.7e308, 1.7e308, 0.0], 0.0)
+        before = self.snapshot()
+        with self.assertRaises(ValueError):
+            self.lin.clip_gradients(1.0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_rejects_non_numeric_or_non_finite_gradients(self):
+        self.lin.forward([0.4, -1.1, 0.9])
+        good_grad, good_grad_bias = [1.0, -2.0, 3.0], 0.5
+        bad_states = [
+            ([1.0, float("nan"), 3.0], 0.5),
+            ([1.0, float("inf"), 3.0], 0.5),
+            ([1.0, "x", 3.0], 0.5),
+            ([1.0, True, 3.0], 0.5),
+            ([1.0, 10 ** 400, 3.0], 0.5),
+            ([1.0, -2.0], 0.5),            # wrong length
+            ("not-a-list", 0.5),
+            (good_grad, float("nan")),
+            (good_grad, float("inf")),
+            (good_grad, None),
+            (good_grad, False),
+        ]
+        for grad, grad_bias in bad_states:
+            self.lin.grad = grad
+            self.lin.grad_bias = grad_bias
+            before = self.snapshot()
+            with self.assertRaises(ValueError):
+                self.lin.clip_gradients(1.0)
+            # The failed call changes nothing, not even the corrupt fields.
+            self.assertEqual(self.snapshot(), before)
+        self.lin.grad = list(good_grad)
+        self.lin.grad_bias = good_grad_bias
+        self.assertEqual(self.lin.clip_gradients(10.0), 1.0)
+
+    def test_clip_then_apply_gradients_uses_published_update(self):
+        self.seed_grads([3.0, 4.0, 0.0], 12.0)
+        ratio = self.lin.clip_gradients(6.5)
+        clipped = list(self.lin.grad)
+        clipped_bias = self.lin.grad_bias
+        old_weight, old_bias, lr = list(self.lin.weight), self.lin.bias, 0.1
+        self.lin.apply_gradients(lr)
+        self.assertTrue(allclose(
+            self.lin.weight,
+            [w - lr * g for w, g in zip(old_weight, clipped)], atol=1e-16))
+        self.assertTrue(close(self.lin.bias, old_bias - lr * clipped_bias,
+                              atol=1e-16))
+        # apply_gradients still does not zero the (clipped) gradients.
+        self.assertEqual(self.lin.grad, clipped)
+        self.assertTrue(close(ratio, 0.5, atol=1e-15))
+
+    def test_clip_then_backward_continues_accumulating(self):
+        self.lin.forward([1.0, 0.0, 0.0])
+        self.lin.backward(0.5)  # grad = [0.5, 0, 0], grad_bias = 0.5
+        ratio = self.lin.clip_gradients(0.5)
+        self.assertTrue(close(ratio, 0.5 / math.hypot(0.5, 0.5), atol=1e-15))
+        clipped = list(self.lin.grad)
+        clipped_bias = self.lin.grad_bias
+        # A further backward accumulates on top of the clipped values.
+        self.lin.backward(0.25)
+        self.assertTrue(allclose(self.lin.grad,
+                                 [clipped[0] + 0.25, clipped[1], clipped[2]],
+                                 atol=1e-15))
+        self.assertTrue(close(self.lin.grad_bias, clipped_bias + 0.25,
+                              atol=1e-15))
+
+
 # Small fixed sample reused across the sequence tests.
 W = [0.4, -0.3]
 B = 0.15
@@ -1816,6 +1968,111 @@ class ForwardReturnIsolationTest(unittest.TestCase):
         ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
         self.assertTrue(allclose(seq.backward(GO), ref.backward(GO),
                                 atol=1e-15))
+
+
+class SequenceClipGradientsTest(unittest.TestCase):
+    """clip_gradients interacts with TanhSequence state only through the
+    Linear gradient fields: everything else is observable unchanged."""
+
+    def sequence_snapshot(self, seq):
+        return (seq.hidden, list(seq.outputs), seq._fwd, seq._stream,
+                list(seq.linear.weight), seq.linear.bias,
+                seq.linear.last, seq.linear._last_weight)
+
+    def test_clip_leaves_sequence_and_cache_state_untouched(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        seq.backward(GO)
+        before = self.sequence_snapshot(seq)
+        grad, grad_bias = list(seq.linear.grad), seq.linear.grad_bias
+        norm = math.hypot(*(grad + [grad_bias]))
+        ratio = seq.linear.clip_gradients(norm / 2.0)
+        self.assertTrue(close(ratio, 0.5, atol=1e-15))
+        self.assertEqual(self.sequence_snapshot(seq), before)
+        # The accumulated gradients were rescaled as one vector.
+        self.assertTrue(allclose(seq.linear.grad,
+                                 [g * ratio for g in grad], atol=1e-15))
+        self.assertTrue(close(seq.linear.grad_bias, grad_bias * ratio,
+                              atol=1e-15))
+        # The cached pass still back-propagates onto the clipped values.
+        again = fresh_sequence(W, B)
+        again.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        again.backward(GO)
+        fresh_grad = list(again.linear.grad)
+        seq.backward(GO)
+        self.assertTrue(allclose(
+            seq.linear.grad,
+            [c + f for c, f in zip([g * ratio for g in grad], fresh_grad)],
+            atol=1e-12))
+
+    def test_failed_clip_leaves_sequence_state_untouched(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2, initial_hidden=H0)
+        seq.backward(GO)
+        before = self.sequence_snapshot(seq)
+        grad_before = list(seq.linear.grad)
+        seq.linear.grad[0] = float("nan")
+        with self.assertRaises(ValueError):
+            seq.linear.clip_gradients(1.0)
+        self.assertEqual(self.sequence_snapshot(seq), before)
+        # The corrupt entry itself is left exactly as it was.
+        self.assertTrue(math.isnan(seq.linear.grad[0]))
+        self.assertEqual(seq.linear.grad[1:], grad_before[1:])
+        # Restoring a valid gradient makes clipping work again.
+        seq.linear.grad = grad_before
+        self.assertEqual(seq.linear.clip_gradients(1e6), 1.0)
+
+    def test_clip_during_open_stream_keeps_session(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for row in ROWS[:3]:
+            seq.step(row)
+        seq.linear.grad = [3.0, 4.0]
+        seq.linear.grad_bias = 12.0
+        before = self.sequence_snapshot(seq)
+        self.assertEqual(seq.linear.clip_gradients(6.5), 0.5)
+        self.assertEqual(self.sequence_snapshot(seq), before)
+        # The session is still alive and commits the full trajectory.
+        for row in ROWS[3:]:
+            seq.step(row)
+        self.assertEqual(len(seq.finish_stream()), len(ROWS))
+
+    def test_checkpoint_restore_and_migration_carry_clipped_gradients(self):
+        seq = fresh_sequence(W, B)
+        seq.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        seq.backward(GO)
+        seq.linear.clip_gradients(0.05)
+        clipped_grad = list(seq.linear.grad)
+        clipped_bias = seq.linear.grad_bias
+        checkpoint = seq.checkpoint()
+        state = seq.export_state()
+        # The exported gradients reflect the most recent successful clip.
+        self.assertEqual(state["linear"]["grad"], clipped_grad)
+        self.assertEqual(state["linear"]["grad_bias"], clipped_bias)
+        # Disrupt, then restore: the clipped gradients come back exactly.
+        seq.linear.zero_grad()
+        seq.restore(checkpoint)
+        self.assertEqual(seq.linear.grad, clipped_grad)
+        self.assertEqual(seq.linear.grad_bias, clipped_bias)
+        migrated = fresh_sequence(W, B)
+        migrated.import_state(state)
+        self.assertEqual(migrated.linear.grad, clipped_grad)
+        self.assertEqual(migrated.linear.grad_bias, clipped_bias)
+
+    def test_multi_feature_gradients_clip_as_one_vector(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        seq.forward(ROWSM, truncate=2, initial_hidden=H0)
+        seq.backward(GOM)
+        grad, grad_bias = list(seq.linear.grad), seq.linear.grad_bias
+        norm = math.hypot(*(grad + [grad_bias]))
+        self.assertEqual(seq.linear.clip_gradients(norm), 1.0)
+        self.assertEqual(seq.linear.grad, grad)
+        ratio = seq.linear.clip_gradients(norm / 4.0)
+        self.assertTrue(close(ratio, 0.25, atol=1e-15))
+        self.assertTrue(allclose(seq.linear.grad,
+                                 [g * ratio for g in grad], atol=1e-15))
+        self.assertTrue(close(seq.linear.grad_bias, grad_bias * ratio,
+                              atol=1e-15))
 
 
 if __name__ == "__main__":

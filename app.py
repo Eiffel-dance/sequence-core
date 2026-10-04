@@ -184,6 +184,53 @@ class Linear:
         self.weight = new_weight
         self.bias = new_bias
 
+    def clip_gradients(self, max_norm):
+        # Explicit gradient-clipping entry for the CPU training loop, to be
+        # called between accumulation and apply_gradients. grad and grad_bias
+        # are treated as one vector and, when its global L2 norm exceeds
+        # max_norm, both are rescaled by the same factor max_norm / norm (no
+        # per-component clipping). Returns 1.0 when nothing was scaled and
+        # the applied factor otherwise. Every argument and accumulated value
+        # is validated, and the whole rescale is computed into locals, before
+        # any field is written, so a rejected call leaves the parameters, the
+        # forward cache and both gradient fields exactly as they were.
+        if isinstance(max_norm, bool) or not isinstance(max_norm, (int, float)):
+            raise ValueError("max_norm must be a Python int or float")
+        _require_finite(max_norm, "max_norm")
+        if max_norm < 0:
+            raise ValueError("max_norm must be non-negative")
+        # The accumulated gradients are validated completely first: a
+        # non-numeric, non-finite or wrongly shaped entry rejects the call
+        # before anything is computed or written.
+        grad = _read_number_sequence(self.grad, len(self.weight), "grad")
+        grad_bias = _read_number(self.grad_bias, "grad_bias")
+        # math.hypot evaluates sqrt(sum of squares) without materializing the
+        # squares, so finite components whose square alone would overflow
+        # still yield the mathematically defined global norm.
+        norm = math.hypot(*(grad + [grad_bias]))
+        if not math.isfinite(norm):
+            raise ValueError("gradient norm must be finite")
+        if norm <= max_norm:
+            # Within the bound (an all-zero gradient in particular, even
+            # against a zero bound): nothing is rescaled.
+            return 1.0
+        ratio = max_norm / norm
+        # A zero bound with a nonzero norm lands here with ratio 0.0 and
+        # zeroes every component. The product of a finite component with a
+        # factor in [0, 1] cannot overflow, but the result is still checked
+        # before committing, so no partial write is possible.
+        try:
+            new_grad = [g * ratio for g in grad]
+            new_grad_bias = grad_bias * ratio
+        except OverflowError:
+            raise ValueError("scaled gradients must be finite")
+        for value in new_grad:
+            _require_finite(value, "scaled gradient")
+        _require_finite(new_grad_bias, "scaled bias gradient")
+        self.grad = new_grad
+        self.grad_bias = new_grad_bias
+        return ratio
+
 
 class _Checkpoint:
     # Immutable-looking snapshot container returned by TanhSequence.checkpoint.
