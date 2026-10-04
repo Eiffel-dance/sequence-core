@@ -886,7 +886,15 @@ class TanhSequence:
             raise
 
         self.hidden = hidden
-        self.outputs = outputs
+        # Each consumer gets its own list: the public outputs field, the
+        # backward cache and the value returned to the caller are independent
+        # copies, so assigning, appending, deleting or clearing elements of the
+        # returned list (or of seq.outputs) can never reach the cached
+        # trajectory used by backward(), checkpoint() or export_state(). The
+        # elements themselves are immutable numbers, so a shallow copy fully
+        # detaches the lists. Two successive calls likewise never share a
+        # returned object.
+        self.outputs = list(outputs)
         # A successful batch traversal supersedes any half-finished stream
         # session; a failed one restored it above.
         self._stream = None
@@ -896,13 +904,13 @@ class TanhSequence:
         self._fwd = {
             "inputs": inputs,
             "prev_hiddens": prev_hiddens,
-            "outputs": outputs,
+            "outputs": list(outputs),
             "boundaries": boundaries,
             "truncate": truncate,
             "carry_hidden": carry_hidden,
             "weights": weights,
         }
-        return self.outputs
+        return list(outputs)
 
     def backward(self, grad_outputs):
         # Terminal hidden-state gradient is zero, so this is exactly the

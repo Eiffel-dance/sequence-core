@@ -1619,5 +1619,204 @@ class MultiFeatureSequenceTest(unittest.TestCase):
             self.assertIsInstance(grad, float)
 
 
+class ForwardReturnIsolationTest(unittest.TestCase):
+    """The list returned by forward must be the caller's alone: mutating it
+    (element assignment, append, del, clear) may never reach seq.outputs, the
+    cached backward trajectory, or restorable state."""
+
+    def _mutate(self, returned):
+        # Exercise every in-place mutation the caller could perform.
+        if returned:
+            returned[0] = 999.0
+        returned.append(1234.0)
+        if len(returned) > 1:
+            del returned[-1]
+        returned.append(-7.0)
+        returned.clear()
+
+    def _assert_trajectory_intact(self, seq, expected, go, gh):
+        # Public field and hidden state still describe the original pass.
+        self.assertTrue(allclose(seq.outputs, expected, atol=1e-15))
+        self.assertTrue(close(seq.hidden, expected[-1], atol=1e-15))
+        # Every backward entry must match a freshly computed, unmodified twin.
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        plain = seq.backward(go)
+        ref_plain = ref.backward(go)
+        self.assertTrue(allclose(plain, ref_plain, atol=1e-15))
+
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        seeded, grad_initial = seq.backward_with_initial_hidden(go, gh)
+        ref_seeded, ref_initial = ref.backward_with_initial_hidden(go, gh)
+        self.assertTrue(allclose(seeded, ref_seeded, atol=1e-15))
+        self.assertTrue(close(grad_initial, ref_initial, atol=1e-15))
+
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        pairs, grad_init_b, boundary_pairs = seq.backward_with_boundaries(go, gh)
+        ref_pairs, ref_init_b, ref_boundary = ref.backward_with_boundaries(go, gh)
+        self.assertTrue(allclose(pairs, ref_pairs, atol=1e-15))
+        self.assertTrue(close(grad_init_b, ref_init_b, atol=1e-15))
+        self.assertEqual(len(boundary_pairs), len(ref_boundary))
+        for (idx, gv), (ref_idx, ref_gv) in zip(boundary_pairs, ref_boundary):
+            self.assertEqual(idx, ref_idx)
+            self.assertTrue(close(gv, ref_gv, atol=1e-15))
+
+    def test_scalar_forward_return_is_independent_list(self):
+        expected = sequence_outputs(W, B, XS, H0, 2, True)
+        seq = fresh_sequence(W, B)
+        returned = seq.forward(ROWS, truncate=2, carry_hidden=True,
+                               initial_hidden=H0)
+        self.assertIsNot(returned, seq.outputs)
+        self.assertIsNot(returned, seq._fwd["outputs"])
+        self.assertIsNot(seq.outputs, seq._fwd["outputs"])
+        self._mutate(returned)
+        self._assert_trajectory_intact(seq, expected, GO, GH)
+
+    def test_empty_single_step_returns_are_independent(self):
+        # Empty input: the returned empty list is still a distinct object.
+        seq = fresh_sequence(W, B)
+        empty = seq.forward([], truncate=2, carry_hidden=True,
+                            initial_hidden=H0)
+        self.assertEqual(empty, [])
+        self.assertIsNot(empty, seq.outputs)
+        self.assertIsNot(empty, seq._fwd["outputs"])
+        empty.append(1.0)
+        self.assertEqual(seq.outputs, [])
+        self.assertEqual(seq._fwd["outputs"], [])
+        # Backward over the empty cache stays valid and carries the terminal
+        # seed straight through to the initial-hidden gradient.
+        input_grads, grad_initial = seq.backward_with_initial_hidden([], GH)
+        self.assertEqual(input_grads, [])
+        self.assertTrue(close(grad_initial, GH, atol=1e-15))
+
+        # Single step: non-empty one-element list, independently held.
+        seq = fresh_sequence(W, B)
+        one = seq.forward(ROWS[:1], initial_hidden=H0)
+        self.assertIsNot(one, seq.outputs)
+        self.assertIsNot(one, seq._fwd["outputs"])
+        expected_one = sequence_outputs(W, B, XS[:1], H0, None, False)
+        one.clear()
+        self.assertTrue(allclose(seq.outputs, expected_one, atol=1e-15))
+        self.assertTrue(allclose(seq._fwd["outputs"], expected_one, atol=1e-15))
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS[:1], initial_hidden=H0)
+        self.assertTrue(allclose(seq.backward(GO[:1]),
+                                ref.backward(GO[:1]), atol=1e-15))
+
+    def test_multi_feature_forward_return_is_independent_list(self):
+        seq = TanhSequence(Linear(list(WM), BM))
+        expected = sequence_outputs_rows(WM, BM, ROWSM, H0, 2, True)
+        returned = seq.forward(ROWSM, truncate=2, carry_hidden=True,
+                               initial_hidden=H0)
+        self.assertIsNot(returned, seq.outputs)
+        self.assertIsNot(returned, seq._fwd["outputs"])
+        self._mutate(returned)
+        self.assertTrue(allclose(seq.outputs, expected, atol=1e-15))
+        # Nested per-feature input gradients of the cached trajectory still
+        # match an unmodified twin, row for row.
+        ref = TanhSequence(Linear(list(WM), BM))
+        ref.forward(ROWSM, truncate=2, carry_hidden=True, initial_hidden=H0)
+        input_grads, grad_initial = seq.backward_with_initial_hidden(GOM, GH)
+        ref_grads, ref_initial = ref.backward_with_initial_hidden(GOM, GH)
+        self.assertEqual(len(input_grads), len(ROWSM))
+        for row, ref_row in zip(input_grads, ref_grads):
+            self.assertTrue(allclose(row, ref_row, atol=1e-15))
+        self.assertTrue(close(grad_initial, ref_initial, atol=1e-15))
+        self.assertTrue(allclose(seq.linear.grad, ref.linear.grad, atol=1e-15))
+        self.assertTrue(close(seq.linear.grad_bias, ref.linear.grad_bias,
+                              atol=1e-15))
+
+    def test_consecutive_forwards_return_isolated_objects(self):
+        seq = fresh_sequence(W, B)
+        first = seq.forward(ROWS[:2], truncate=1)
+        second = seq.forward(ROWS, truncate=2, carry_hidden=True,
+                             initial_hidden=H0)
+        second_expected = sequence_outputs(W, B, XS, H0, 2, True)
+        self.assertIsNot(first, second)
+        # Mutating either returned list changes neither the other returned
+        # list nor the live/cached trajectory (which is the latest pass).
+        first.clear()
+        self.assertTrue(allclose(second, second_expected, atol=1e-15))
+        second.clear()
+        self.assertTrue(allclose(seq.outputs, second_expected, atol=1e-15))
+        self.assertTrue(allclose(seq._fwd["outputs"], second_expected, atol=1e-15))
+
+    def test_finished_stream_return_is_independent_of_live_outputs(self):
+        seq = fresh_sequence(W, B)
+        seq.start_stream(initial_hidden=H0, truncate=2, carry_hidden=True)
+        for row in ROWS:
+            seq.step(row)
+        returned = seq.finish_stream()
+        self.assertIsNot(returned, seq.outputs)
+        self.assertIsNot(returned, seq._fwd["outputs"])
+        expected = sequence_outputs(W, B, XS, H0, 2, True)
+        self._mutate(returned)
+        self.assertTrue(allclose(seq.outputs, expected, atol=1e-15))
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        self.assertTrue(allclose(seq.backward(GO), ref.backward(GO),
+                                atol=1e-15))
+
+    def test_checkpoint_and_exports_keep_original_trajectory(self):
+        expected = sequence_outputs(W, B, XS, H0, 2, True)
+        seq = fresh_sequence(W, B)
+        returned = seq.forward(ROWS, truncate=2, carry_hidden=True,
+                               initial_hidden=H0)
+        checkpoint = seq.checkpoint()
+        state = seq.export_state()
+        # Destroy the caller's list after the snapshots: restorable state must
+        # still describe the original forward results.
+        self._mutate(returned)
+
+        # A checkpoint belongs to its owner; verify on that owner by
+        # disrupting it first, then restoring the saved trajectory.
+        seq.reset()
+        seq.restore(checkpoint)
+        self.assertTrue(allclose(seq.outputs, expected, atol=1e-15))
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        self.assertTrue(allclose(seq.backward(GO), ref.backward(GO),
+                                atol=1e-15))
+
+        # export_state captured the trajectory before the caller's mutation.
+        self.assertTrue(allclose(state["outputs"], expected, atol=1e-15))
+        self.assertTrue(allclose(state["forward"]["outputs"], expected,
+                                atol=1e-15))
+        imported = fresh_sequence(W, B)
+        imported.import_state(state)
+        self.assertTrue(allclose(imported.outputs, expected, atol=1e-15))
+        ref2 = fresh_sequence(W, B)
+        ref2.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        self.assertTrue(allclose(imported.backward(GO), ref2.backward(GO),
+                                atol=1e-15))
+
+    def test_failed_forward_after_mutation_keeps_backward_cache(self):
+        # A bad follow-up forward must stay atomic and leave the original
+        # cache back-propagatable even when the first returned list was
+        # subsequently mutated.
+        seq = fresh_sequence(W, B)
+        returned = seq.forward(ROWS, truncate=2, carry_hidden=True,
+                               initial_hidden=H0)
+        self._mutate(returned)
+        with self.assertRaises(ValueError):
+            seq.forward([[1.0], [1.0, 2.0]], truncate=2)
+        with self.assertRaises(ValueError):
+            seq.forward(ROWS, truncate=0)
+        with self.assertRaises(ValueError):
+            seq.forward(ROWS, carry_hidden="yes")
+        with self.assertRaises(ValueError):
+            seq.forward(ROWS, initial_hidden=float("nan"))
+        with self.assertRaises(ValueError):
+            seq.forward(ROWS, segment_starts=[True])
+        expected = sequence_outputs(W, B, XS, H0, 2, True)
+        self.assertTrue(allclose(seq.outputs, expected, atol=1e-15))
+        ref = fresh_sequence(W, B)
+        ref.forward(ROWS, truncate=2, carry_hidden=True, initial_hidden=H0)
+        self.assertTrue(allclose(seq.backward(GO), ref.backward(GO),
+                                atol=1e-15))
+
+
 if __name__ == "__main__":
     unittest.main()
