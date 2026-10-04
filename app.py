@@ -1229,3 +1229,37 @@ class SoftplusSequence(TanhSequence):
         # outputs, and output is non-negative so the exponential can never
         # overflow.
         return -math.expm1(-output)
+
+
+class ReLUSequence(TanhSequence):
+    """Rectified-linear counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is relu(z) = max(0, z) — exactly 0.0 for z <= 0 and exactly z
+    for z > 0 — and the local derivative carried through backward is 0.0
+    where the cached output is 0 and 1.0 where it is positive. Exported
+    states carry a distinct kind tag ("ReLUSequenceState"), so a state of
+    any other sequence class never migrates into a ReLUSequence (or vice
+    versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "ReLUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # The pre-activation is already validated finite by Linear.forward,
+        # and the result is either the exact zero constant or z itself, so
+        # every finite input yields a finite output with no overflow path.
+        return z if z > 0 else 0.0
+
+    @staticmethod
+    def _activation_derivative(output):
+        # The cached output is exactly 0.0 wherever z <= 0 and equals z
+        # wherever z > 0, so it alone decides the branch: derivative 0 at
+        # zero output, 1 at positive output.
+        return 1.0 if output > 0 else 0.0
