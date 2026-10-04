@@ -108,6 +108,103 @@ def _read_grad_list(values, expected_length):
     return result
 
 
+# Version tag of the export_state/import_state state-object format. Only
+# version 1 exists; importers accept nothing else.
+_STATE_VERSION = 1
+
+
+def _validate_trajectory_record(record, width, extra_keys, expect_initial,
+                                fail, nonfinite_message):
+    """Validate one cached trajectory record (batch cache or stream session).
+
+    Structural violations are reported by calling ``fail``; a numeric value
+    outside the finite domain raises ValueError with ``nonfinite_message``.
+    ``record["boundaries"]`` must already be a set of indices.
+    """
+    def need_number(value):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            fail()
+        if not _is_finite(value):
+            raise ValueError(nonfinite_message)
+
+    def need_number_list(value, length=None):
+        if not isinstance(value, list):
+            fail()
+        if length is not None and len(value) != length:
+            fail()
+        for item in value:
+            need_number(item)
+
+    # Structural validation first: exact key set, scalar/list types, finite
+    # numeric domain, equal per-step lengths and boundary indices inside the
+    # valid range.
+    if not isinstance(record, dict):
+        fail()
+    keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
+            "truncate", "carry_hidden", "weights"} | extra_keys
+    if set(record.keys()) != keys:
+        fail()
+    truncate = record["truncate"]
+    if truncate is not None:
+        if (isinstance(truncate, bool)
+                or not isinstance(truncate, int) or truncate <= 0):
+            fail()
+    if not isinstance(record["carry_hidden"], bool):
+        fail()
+    need_number_list(record["weights"], width)
+    n = len(record["outputs"])
+    if (len(record["inputs"]) != n
+            or len(record["prev_hiddens"]) != n):
+        fail()
+    need_number_list(record["outputs"])
+    need_number_list(record["prev_hiddens"])
+    if not isinstance(record["inputs"], list):
+        fail()
+    for row in record["inputs"]:
+        need_number_list(row, width - 1)
+    if not isinstance(record["boundaries"], set):
+        fail()
+    for index in record["boundaries"]:
+        if not isinstance(index, int) or isinstance(index, bool) \
+                or not 0 <= index < n:
+            fail()
+    # Open-stream records alone remember the session's starting hidden
+    # state; read it only once the exact key set above has been confirmed.
+    initial_hidden = None
+    if expect_initial:
+        initial_hidden = record["initial_hidden"]
+        need_number(initial_hidden)
+    # Semantic validation: the arrays must describe one and the same
+    # traversal. Every period the truncate rule cuts must be present in the
+    # boundary set (explicit starts may add more), and each prev_hiddens
+    # entry must be the value that step actually consumed: a stream's first
+    # step consumes its initial_hidden; a nonzero boundary consumes the
+    # previous segment's last output when carrying, else exactly zero;
+    # every other step continues from the previous output.
+    boundaries = record["boundaries"]
+    if truncate is not None:
+        for index in range(n):
+            if index % truncate == 0 and index not in boundaries:
+                fail()
+    outputs = record["outputs"]
+    prev_hiddens = record["prev_hiddens"]
+    carry = record["carry_hidden"]
+    for t in range(n):
+        if t == 0:
+            # Only open-stream records remember the session's
+            # initial_hidden; a committed batch record has no stored
+            # starting value to compare step 0 against.
+            if initial_hidden is not None \
+                    and prev_hiddens[0] != initial_hidden:
+                fail()
+        elif t in boundaries:
+            expected = outputs[t - 1] if carry else 0.0
+            if prev_hiddens[t] != expected:
+                fail()
+        elif prev_hiddens[t] != outputs[t - 1]:
+            fail()
+
+
 class Linear:
     def __init__(self, weight, bias=0.0):
         weights = _read_number_sequence(weight, None, "weight")
@@ -359,78 +456,13 @@ class TanhSequence:
                 need_number_list(checkpoint._linear_last_weight, width)
 
             def validate_trajectory(record, extra_keys, expect_initial=False):
-                # Structural validation first: exact key set, scalar/list
-                # types, finite numeric domain, equal per-step lengths and
-                # boundary indices inside the valid range.
+                # Structural and semantic validation of one trajectory
+                # record, shared with the import_state entry point.
                 if record is None:
                     return
-                if not isinstance(record, dict):
-                    fail()
-                keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
-                        "truncate", "carry_hidden", "weights"} | extra_keys
-                if set(record.keys()) != keys:
-                    fail()
-                truncate = record["truncate"]
-                if truncate is not None:
-                    if (isinstance(truncate, bool)
-                            or not isinstance(truncate, int) or truncate <= 0):
-                        fail()
-                if not isinstance(record["carry_hidden"], bool):
-                    fail()
-                need_number_list(record["weights"], width)
-                n = len(record["outputs"])
-                if (len(record["inputs"]) != n
-                        or len(record["prev_hiddens"]) != n):
-                    fail()
-                need_number_list(record["outputs"])
-                need_number_list(record["prev_hiddens"])
-                if not isinstance(record["inputs"], list):
-                    fail()
-                for row in record["inputs"]:
-                    need_number_list(row, width - 1)
-                if not isinstance(record["boundaries"], set):
-                    fail()
-                for index in record["boundaries"]:
-                    if not isinstance(index, int) or isinstance(index, bool) \
-                            or not 0 <= index < n:
-                        fail()
-                # Open-stream records alone remember the session's starting
-                # hidden state; read it only once the exact key set above has
-                # been confirmed.
-                initial_hidden = None
-                if expect_initial:
-                    initial_hidden = record["initial_hidden"]
-                    need_number(initial_hidden)
-                # Semantic validation: the arrays must describe one and the
-                # same traversal. Every period the truncate rule cuts must be
-                # present in the boundary set (explicit starts may add more),
-                # and each prev_hiddens entry must be the value that step
-                # actually consumed: a stream's first step consumes its
-                # initial_hidden; a nonzero boundary consumes the previous
-                # segment's last output when carrying, else exactly zero;
-                # every other step continues from the previous output.
-                boundaries = record["boundaries"]
-                if truncate is not None:
-                    for index in range(n):
-                        if index % truncate == 0 and index not in boundaries:
-                            fail()
-                outputs = record["outputs"]
-                prev_hiddens = record["prev_hiddens"]
-                carry = record["carry_hidden"]
-                for t in range(n):
-                    if t == 0:
-                        # Only open-stream records remember the session's
-                        # initial_hidden; a committed batch record has no
-                        # stored starting value to compare step 0 against.
-                        if initial_hidden is not None \
-                                and prev_hiddens[0] != initial_hidden:
-                            fail()
-                    elif t in boundaries:
-                        expected = outputs[t - 1] if carry else 0.0
-                        if prev_hiddens[t] != expected:
-                            fail()
-                    elif prev_hiddens[t] != outputs[t - 1]:
-                        fail()
+                _validate_trajectory_record(
+                    record, width, extra_keys, expect_initial, fail,
+                    "checkpoint contains a non-finite numeric value")
 
             # The committed batch pass and an open stream session are mutually
             # exclusive in live state, so a checkpoint carrying both could
@@ -519,6 +551,251 @@ class TanhSequence:
         self.linear._last_weight = None \
             if checkpoint._linear_last_weight is None \
             else list(checkpoint._linear_last_weight)
+        return None
+
+    def export_state(self):
+        # Captures the same complete state checkpoint() preserves, but as a
+        # portable state object that is not tied to this instance: it can be
+        # imported into any TanhSequence wrapping a Linear of the same
+        # width. The object is built solely from dicts, lists, finite
+        # numbers, booleans and None, plus the fixed integer version tag, so
+        # it survives a JSON round trip unchanged. The call never mutates
+        # any state and may be made on a fresh object, after reset(), after
+        # a batch forward, or in the middle of a stream session. Every
+        # mutable datum is deep-copied and each boundary set is emitted as a
+        # sorted integer list, so the result shares no reference with live
+        # state or with any other export, and can be imported any number of
+        # times.
+        fwd = self._fwd
+        if fwd is None:
+            fwd_state = None
+        else:
+            fwd_state = {
+                "inputs": [list(row) for row in fwd["inputs"]],
+                "prev_hiddens": list(fwd["prev_hiddens"]),
+                "outputs": list(fwd["outputs"]),
+                "boundaries": sorted(fwd["boundaries"]),
+                "truncate": fwd["truncate"],
+                "carry_hidden": fwd["carry_hidden"],
+                "weights": list(fwd["weights"]),
+            }
+        stream = self._stream
+        if stream is None:
+            stream_state = None
+        else:
+            stream_state = {
+                "inputs": [list(row) for row in stream["inputs"]],
+                "prev_hiddens": list(stream["prev_hiddens"]),
+                "outputs": list(stream["outputs"]),
+                "boundaries": sorted(stream["boundaries"]),
+                "truncate": stream["truncate"],
+                "carry_hidden": stream["carry_hidden"],
+                "initial_hidden": stream["initial_hidden"],
+                "weights": list(stream["weights"]),
+            }
+        return {
+            "version": _STATE_VERSION,
+            "width": self.d + 1,
+            "hidden": self.hidden,
+            "outputs": list(self.outputs),
+            "forward": fwd_state,
+            "stream": stream_state,
+            "linear": {
+                "weight": list(self.linear.weight),
+                "bias": self.linear.bias,
+                "grad": list(self.linear.grad),
+                "grad_bias": self.linear.grad_bias,
+                "last": None if self.linear.last is None
+                else list(self.linear.last),
+                "last_weight": None if self.linear._last_weight is None
+                else list(self.linear._last_weight),
+            },
+        }
+
+    def import_state(self, state):
+        # Validate first, then commit atomically: a rejected state object
+        # must leave hidden state, outputs, any open stream session, the
+        # Linear's parameters/gradients and its forward cache exactly as
+        # they were. Accepts the object returned by export_state(), a deep
+        # copy of it, or an equivalent object rebuilt from a JSON round
+        # trip. A state whose version is unsupported, whose width disagrees
+        # with the current Linear, or that is structurally corrupted is
+        # rejected, as is one whose trajectory, boundary or hidden-state
+        # relations could never have been produced by export_state().
+        if not isinstance(state, dict):
+            raise ValueError(
+                "import_state requires a state object from export_state()")
+
+        def fail():
+            raise ValueError("state is corrupted")
+
+        def need_number(value):
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                fail()
+            if not _is_finite(value):
+                raise ValueError("state contains a non-finite numeric value")
+
+        def need_number_list(value, length=None):
+            if not isinstance(value, list):
+                fail()
+            if length is not None and len(value) != length:
+                fail()
+            for item in value:
+                need_number(item)
+
+        def _validate():
+            if set(state.keys()) != {"version", "width", "hidden", "outputs",
+                                     "forward", "stream", "linear"}:
+                fail()
+            version = state["version"]
+            if isinstance(version, bool) or not isinstance(version, int):
+                fail()
+            if version != _STATE_VERSION:
+                raise ValueError(
+                    "unsupported state version %r" % (version,))
+            width = state["width"]
+            if isinstance(width, bool) or not isinstance(width, int) \
+                    or width < 2:
+                fail()
+            if width != len(self.linear.weight):
+                raise ValueError(
+                    "state width %d is incompatible with the current "
+                    "Linear width %d" % (width, len(self.linear.weight)))
+
+            need_number(state["hidden"])
+            need_number_list(state["outputs"])
+
+            # The wrapped Linear's parameters, accumulated gradients and
+            # last-forward cache. The cached inputs and the weights that
+            # produced them are either both absent or both full-width.
+            linear = state["linear"]
+            if not isinstance(linear, dict) \
+                    or set(linear.keys()) != {"weight", "bias", "grad",
+                                              "grad_bias", "last",
+                                              "last_weight"}:
+                fail()
+            need_number_list(linear["weight"], width)
+            need_number(linear["bias"])
+            need_number_list(linear["grad"], width)
+            need_number(linear["grad_bias"])
+            if linear["last"] is None:
+                if linear["last_weight"] is not None:
+                    fail()
+            else:
+                need_number_list(linear["last"], width)
+                if linear["last_weight"] is None:
+                    fail()
+                need_number_list(linear["last_weight"], width)
+
+            def normalize_trajectory(record, extra_keys, expect_initial=False):
+                # State objects carry boundaries as an ordered integer list;
+                # convert to the set form the shared validator expects.
+                if record is None:
+                    return None
+                if not isinstance(record, dict):
+                    fail()
+                keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
+                        "truncate", "carry_hidden", "weights"} | extra_keys
+                if set(record.keys()) != keys:
+                    fail()
+                boundaries = record["boundaries"]
+                if not isinstance(boundaries, list):
+                    fail()
+                boundary_set = set()
+                for index in boundaries:
+                    if not isinstance(index, int) or isinstance(index, bool):
+                        fail()
+                    boundary_set.add(index)
+                normalized = dict(record)
+                normalized["boundaries"] = boundary_set
+                _validate_trajectory_record(
+                    normalized, width, extra_keys, expect_initial, fail,
+                    "state contains a non-finite numeric value")
+                return normalized
+
+            # The committed batch pass and an open stream session are
+            # mutually exclusive in live state, so a state object carrying
+            # both could never have been produced and is rejected outright.
+            fwd_record = normalize_trajectory(state["forward"], set())
+            stream = normalize_trajectory(state["stream"], {"initial_hidden"},
+                                          expect_initial=True)
+            if fwd_record is not None and stream is not None:
+                fail()
+
+            # Either trajectory, when present, must equal the visible
+            # outputs captured at export time.
+            if fwd_record is not None \
+                    and fwd_record["outputs"] != state["outputs"]:
+                fail()
+            if stream is not None and stream["outputs"] != state["outputs"]:
+                fail()
+
+            # The public hidden state must agree with the visible
+            # trajectory: it is the last produced output whenever one
+            # exists; an empty open session still sits exactly at its
+            # initial_hidden. With no trajectory and no open session the
+            # finite-domain check above is all the hidden slot can be
+            # judged against.
+            if state["outputs"]:
+                if state["hidden"] != state["outputs"][-1]:
+                    fail()
+            elif stream is not None:
+                if state["hidden"] != stream["initial_hidden"]:
+                    fail()
+            return fwd_record, stream
+
+        # All validation happens before any state is touched, so a rejected
+        # state object always raises ValueError and leaves the instance
+        # completely unchanged.
+        try:
+            fwd_record, stream = _validate()
+        except ValueError:
+            raise
+        except (AttributeError, TypeError, KeyError):
+            raise ValueError("state is corrupted")
+
+        # Everything validated: commit copies of the state's data so a later
+        # mutation of the state object (or another import of it) can never
+        # reach the live state through a shared reference, and repeatedly
+        # importing one state object always yields the same trajectory. An
+        # open session in the current instance is simply overwritten.
+        fwd_copy = None
+        if fwd_record is not None:
+            fwd_copy = {
+                "inputs": [list(row) for row in fwd_record["inputs"]],
+                "prev_hiddens": list(fwd_record["prev_hiddens"]),
+                "outputs": list(fwd_record["outputs"]),
+                "boundaries": set(fwd_record["boundaries"]),
+                "truncate": fwd_record["truncate"],
+                "carry_hidden": fwd_record["carry_hidden"],
+                "weights": list(fwd_record["weights"]),
+            }
+        stream_copy = None
+        if stream is not None:
+            stream_copy = {
+                "inputs": [list(row) for row in stream["inputs"]],
+                "prev_hiddens": list(stream["prev_hiddens"]),
+                "outputs": list(stream["outputs"]),
+                "boundaries": set(stream["boundaries"]),
+                "truncate": stream["truncate"],
+                "carry_hidden": stream["carry_hidden"],
+                "initial_hidden": stream["initial_hidden"],
+                "weights": list(stream["weights"]),
+            }
+
+        linear = state["linear"]
+        self.hidden = state["hidden"]
+        self.outputs = list(state["outputs"])
+        self._fwd = fwd_copy
+        self._stream = stream_copy
+        self.linear.weight = list(linear["weight"])
+        self.linear.bias = linear["bias"]
+        self.linear.grad = list(linear["grad"])
+        self.linear.grad_bias = linear["grad_bias"]
+        self.linear.last = None if linear["last"] is None \
+            else list(linear["last"])
+        self.linear._last_weight = None if linear["last_weight"] is None \
+            else list(linear["last_weight"])
         return None
 
     def step(self, row, segment_start=False):
