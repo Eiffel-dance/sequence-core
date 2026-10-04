@@ -3,10 +3,26 @@ import weakref
 from collections.abc import Sequence
 
 
+def _require_finite(value, what):
+    """Reject NaN, infinities, and values too large for float arithmetic.
+
+    Every accepted value must survive conversion to float: a huge int is
+    finite as an integer but overflows the moment standard-library float
+    arithmetic (or math.tanh) touches it, so it is rejected up front.
+    """
+    try:
+        as_float = float(value)
+    except OverflowError:
+        raise ValueError("%s must be a finite number" % what)
+    if not math.isfinite(as_float):
+        raise ValueError("%s must be a finite number" % what)
+
+
 def _read_number(value, what):
     """Validate a scalar argument; bool is not accepted as a number."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("%s must be a Python int or float" % what)
+    _require_finite(value, what)
     return value
 
 
@@ -25,6 +41,7 @@ def _read_number_sequence(values, expected_length, what):
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each element of %s must be an int or float" % what)
+        _require_finite(value, "each element of %s" % what)
         result.append(value)
     return result
 
@@ -44,6 +61,7 @@ def _read_row(row, width):
     for value in row:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each input value must be an int or float")
+        _require_finite(value, "each input value")
         values.append(value)
     return values
 
@@ -80,6 +98,7 @@ def _read_grad_list(values, expected_length):
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each output gradient must be a number")
+        _require_finite(value, "each output gradient")
         result.append(float(value))
     return result
 
@@ -126,6 +145,12 @@ class Linear:
         _read_number(learning_rate, "learning_rate")
         new_weight = [w - learning_rate * g for w, g in zip(self.weight, self.grad)]
         new_bias = self.bias - learning_rate * self.grad_bias
+        # Commit only when every updated parameter is still finite; a
+        # non-finite result rejects the whole update, so neither weight nor
+        # bias is partially written.
+        for value in new_weight:
+            _require_finite(value, "updated weight")
+        _require_finite(new_bias, "updated bias")
         self.weight = new_weight
         self.bias = new_bias
 
@@ -270,9 +295,16 @@ class TanhSequence:
                     "Linear width %d"
                     % (checkpoint._width, len(self.linear.weight)))
 
-            # A scalar is any non-bool int/float.
+            # A scalar is any non-bool int/float that is finite and small
+            # enough for float arithmetic (NaN, infinities, and ints whose
+            # float conversion overflows are rejected).
             def need_number(value):
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    fail()
+                try:
+                    if not math.isfinite(float(value)):
+                        fail()
+                except OverflowError:
                     fail()
 
             def need_number_list(value, length=None):
@@ -422,8 +454,18 @@ class TanhSequence:
                 "segment_start=True requires an active stream session; "
                 "call start_stream first")
         # Compute into a local first; only commit once the Linear forward and
-        # the tanh succeeded.
-        new_hidden = math.tanh(self.linear.forward(values + [self.hidden]))
+        # the tanh succeeded. Finite inputs can still overflow standard-
+        # library arithmetic (e.g. huge integer products reaching math.tanh);
+        # that rejects the step without touching hidden/outputs or the
+        # Linear's last-forward record.
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        try:
+            new_hidden = math.tanh(self.linear.forward(values + [self.hidden]))
+        except OverflowError:
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            raise ValueError("step computation overflowed float arithmetic")
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         # Continuing the trajectory stepwise mixes it with any recorded batch
@@ -457,7 +499,20 @@ class TanhSequence:
             stream["boundaries"].add(i)
         else:
             hidden = self.hidden
-        new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+        # As in step(): an arithmetic overflow rejects only this step and
+        # restores the Linear's last-forward record; the session stays alive.
+        # The boundary mark for this index (added above) is rolled back too:
+        # each step index is recorded at most once, so discarding it cannot
+        # remove an earlier step's mark.
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        try:
+            new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+        except OverflowError:
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            stream["boundaries"].discard(i)
+            raise ValueError("step computation overflowed float arithmetic")
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         stream["inputs"].append(values)
@@ -610,7 +665,11 @@ class TanhSequence:
                 hidden = math.tanh(self.linear.forward(x + [hidden]))
                 inputs.append(x)
                 outputs.append(hidden)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError) as exc:
+            # OverflowError reaches here when finite-looking inputs still
+            # overflow standard-library arithmetic mid-traversal (e.g. huge
+            # integer products reaching math.tanh); it is re-raised as a
+            # ValueError below after the rollback.
             self.hidden = saved_hidden
             self.outputs = saved_outputs
             self._fwd = saved_fwd
@@ -619,6 +678,8 @@ class TanhSequence:
             self.linear._last_weight = saved_last_weight
             self.linear.grad = saved_grad
             self.linear.grad_bias = saved_grad_bias
+            if isinstance(exc, OverflowError):
+                raise ValueError("forward computation overflowed float arithmetic")
             raise
 
         self.hidden = hidden
