@@ -213,6 +213,14 @@ class _Checkpoint:
         self._linear_last_weight = linear_last_weight
 
 
+# Version of the portable state format produced by TanhSequence.export_state.
+# Only version 1 exists; import_state rejects anything else.
+_STATE_VERSION = 1
+# Type tag carried by every exported state so a foreign dict is rejected
+# before any field is interpreted.
+_STATE_KIND = "TanhSequenceState"
+
+
 class TanhSequence:
     def __init__(self, linear):
         # A Linear with at least two weights: the first d = len(weight) - 1
@@ -520,6 +528,138 @@ class TanhSequence:
             if checkpoint._linear_last_weight is None \
             else list(checkpoint._linear_last_weight)
         return None
+
+    def export_state(self):
+        # Portable counterpart of checkpoint(): captures exactly the same
+        # state, but as an independent plain-data object (only dicts, lists,
+        # finite numbers, booleans, strings and None) that is not tied to
+        # this instance and can migrate to any other TanhSequence wrapping a
+        # Linear of the same width. The call never mutates any state, and
+        # every mutable datum is freshly built, so the result shares no
+        # reference with the instance or with any other export, survives
+        # later computation, and round-trips through JSON unchanged. Boundary
+        # sets travel as sorted integer lists; an absent batch cache or
+        # stream session is represented by None.
+        def dump_trajectory(record, include_initial):
+            data = {
+                "inputs": [list(row) for row in record["inputs"]],
+                "prev_hiddens": list(record["prev_hiddens"]),
+                "outputs": list(record["outputs"]),
+                "boundaries": sorted(record["boundaries"]),
+                "truncate": record["truncate"],
+                "carry_hidden": record["carry_hidden"],
+                "weights": list(record["weights"]),
+            }
+            if include_initial:
+                data["initial_hidden"] = record["initial_hidden"]
+            return data
+
+        fwd = self._fwd
+        stream = self._stream
+        return {
+            "version": _STATE_VERSION,
+            "kind": _STATE_KIND,
+            "width": self.d + 1,
+            "hidden": self.hidden,
+            "outputs": list(self.outputs),
+            "forward": None if fwd is None else dump_trajectory(fwd, False),
+            "stream": None if stream is None else dump_trajectory(stream, True),
+            "linear": {
+                "weight": list(self.linear.weight),
+                "bias": self.linear.bias,
+                "grad": list(self.linear.grad),
+                "grad_bias": self.linear.grad_bias,
+                "last": None if self.linear.last is None
+                else list(self.linear.last),
+                "last_weight": None if self.linear._last_weight is None
+                else list(self.linear._last_weight),
+            },
+        }
+
+    def import_state(self, state):
+        # Validate completely, then commit atomically. Structural validation
+        # (plain-data types, exact field sets, version and kind) happens here;
+        # the parsed state is then turned into a checkpoint owned by this
+        # instance and funneled through restore(), which re-validates every
+        # semantic rule (finite numeric domain, width compatibility,
+        # trajectory/boundary consistency, the truncation hidden-state rules,
+        # batch-cache/stream exclusivity, Linear cache shapes) before
+        # committing, so any rejected state raises ValueError and leaves the
+        # sequence state, the Linear's parameters, its cache and its
+        # gradients exactly as they were. The input object is never mutated,
+        # the committed state shares no reference with it, and importing the
+        # same object repeatedly yields the same result.
+        checkpoint = self._parse_exported_state(state)
+        return self.restore(checkpoint)
+
+    def _parse_exported_state(self, state):
+        # Structural validation of a plain-data state object and conversion
+        # into a _Checkpoint owned by this instance. Only the boundary lists
+        # are converted (to the sets restore() expects); every other value is
+        # passed through for restore()'s semantic validation.
+        def fail():
+            raise ValueError("state has an invalid structure")
+
+        if not isinstance(state, dict):
+            raise ValueError(
+                "import_state requires a state produced by export_state()")
+        if set(state.keys()) != {"version", "kind", "width", "hidden",
+                                 "outputs", "forward", "stream", "linear"}:
+            fail()
+        version = state["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            fail()
+        if version != _STATE_VERSION:
+            raise ValueError("unsupported state version %r" % (version,))
+        if state["kind"] != _STATE_KIND:
+            fail()
+        width = state["width"]
+        if isinstance(width, bool) or not isinstance(width, int) or width < 2:
+            fail()
+        linear = state["linear"]
+        if not isinstance(linear, dict) \
+                or set(linear.keys()) != {"weight", "bias", "grad",
+                                          "grad_bias", "last", "last_weight"}:
+            fail()
+
+        def parse_trajectory(record, expect_initial):
+            if record is None:
+                return None
+            if not isinstance(record, dict):
+                fail()
+            keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
+                    "truncate", "carry_hidden", "weights"}
+            if expect_initial:
+                keys = keys | {"initial_hidden"}
+            if set(record.keys()) != keys:
+                fail()
+            boundaries = record["boundaries"]
+            if not isinstance(boundaries, list):
+                fail()
+            for index in boundaries:
+                if isinstance(index, bool) or not isinstance(index, int):
+                    fail()
+            # Shallow copy so the caller's dict is never mutated; restore()
+            # deep-copies everything it commits, so no reference to the
+            # input object can reach the live state.
+            parsed = dict(record)
+            parsed["boundaries"] = set(boundaries)
+            return parsed
+
+        return _Checkpoint(
+            owner_ref=weakref.ref(self),
+            width=width,
+            hidden=state["hidden"],
+            outputs=state["outputs"],
+            fwd=parse_trajectory(state["forward"], False),
+            stream=parse_trajectory(state["stream"], True),
+            linear_weight=linear["weight"],
+            linear_bias=linear["bias"],
+            linear_grad=linear["grad"],
+            linear_grad_bias=linear["grad_bias"],
+            linear_last=linear["last"],
+            linear_last_weight=linear["last_weight"],
+        )
 
     def step(self, row, segment_start=False):
         # Validate before any state is touched, so a rejected row changes
