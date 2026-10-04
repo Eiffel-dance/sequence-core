@@ -743,24 +743,57 @@ class TanhSequence:
         i = len(stream["inputs"])
         truncate = stream["truncate"]
         truncate_boundary = truncate is not None and i % truncate == 0
-        if truncate_boundary or segment_start:
-            # Segment start. The first segment starts from the session's
-            # initial hidden state; without carry every later segment resets
-            # to zero; with carry it starts from a numeric copy of the
-            # previous segment's last hidden value. That copy is detached: it
-            # enters this step's local derivatives but no gradient crosses
-            # back over the boundary. Explicit segment_start marks merge with
-            # the truncate-produced boundaries.
+        is_boundary = truncate_boundary or segment_start
+        # Select the hidden input this step consumes purely locally, without
+        # touching the session: the boundary mark is committed only after the
+        # step has fully succeeded below. The first segment starts from the
+        # session's initial hidden state; without carry every later segment
+        # resets to zero; with carry it starts from a numeric copy of the
+        # previous segment's last hidden value. That copy is detached: it
+        # enters this step's local derivatives but no gradient crosses
+        # back over the boundary. Explicit segment_start marks merge with
+        # the truncate-produced boundaries.
+        if is_boundary:
             if i == 0:
                 hidden = stream["initial_hidden"]
             elif stream["carry_hidden"]:
                 hidden = float(stream["outputs"][-1])
             else:
                 hidden = 0.0
-            stream["boundaries"].add(i)
         else:
             hidden = self.hidden
-        new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+
+        # Snapshot every observable datum the computation may touch so that a
+        # rejected step (the linear arithmetic overflowing, or producing any
+        # other non-finite result) rolls the session back to exactly its
+        # pre-call state: no boundary mark, no advanced public hidden/output,
+        # no appended trajectory entry, and the previous successful step's
+        # Linear forward record and accumulated gradients intact.
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+        saved_boundaries = set(stream["boundaries"])
+        try:
+            new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            stream["boundaries"] = saved_boundaries
+            raise
+
+        # The whole step computed successfully: only now commit the boundary
+        # mark, the advanced hidden/output state and this step's trajectory
+        # entry, so an immediately retried row is bit-for-bit identical to a
+        # call that never failed.
+        if is_boundary:
+            stream["boundaries"].add(i)
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         stream["inputs"].append(values)
