@@ -233,10 +233,11 @@ class Linear:
 
 
 class _Checkpoint:
-    # Immutable-looking snapshot container returned by TanhSequence.checkpoint.
-    # It stores only independent copies; nothing it references aliases live
-    # instance state. The weakref ties the checkpoint to the exact
-    # TanhSequence that created it, so another instance rejects it on restore.
+    # Immutable-looking snapshot container returned by the sequence classes'
+    # checkpoint(). It stores only independent copies; nothing it references
+    # aliases live instance state. The weakref ties the checkpoint to the
+    # exact instance that created it, so another instance rejects it on
+    # restore.
     __slots__ = (
         "_owner_ref", "_width", "_hidden", "_outputs", "_fwd", "_stream",
         "_linear_weight", "_linear_bias", "_linear_grad", "_linear_grad_bias",
@@ -260,15 +261,28 @@ class _Checkpoint:
         self._linear_last_weight = linear_last_weight
 
 
-# Version of the portable state format produced by TanhSequence.export_state.
-# Only version 1 exists; import_state rejects anything else.
+# Version of the portable state format produced by export_state(). Only
+# version 1 exists; import_state rejects anything else. The rule is shared by
+# every sequence class.
 _STATE_VERSION = 1
-# Type tag carried by every exported state so a foreign dict is rejected
-# before any field is interpreted.
-_STATE_KIND = "TanhSequenceState"
 
 
 class TanhSequence:
+    # Type tag carried by every exported state so a foreign dict (including
+    # one produced by another sequence class) is rejected before any field is
+    # interpreted. Each sequence class declares its own.
+    _STATE_KIND = "TanhSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # Pointwise activation applied to the finite pre-activation z.
+        return math.tanh(z)
+
+    @staticmethod
+    def _activation_derivative(output):
+        # Local derivative of the activation, expressed in the cached output.
+        return 1.0 - output * output
+
     def __init__(self, linear):
         # A Linear with at least two weights: the first d = len(weight) - 1
         # weights are the input-feature coefficients, the last weight is the
@@ -276,9 +290,13 @@ class TanhSequence:
         # Rejected immediately, without touching the passed layer's
         # parameters, gradients, or last-forward record.
         if not isinstance(linear, Linear):
-            raise ValueError("TanhSequence requires a Linear with at least two weights")
+            raise ValueError(
+                "%s requires a Linear with at least two weights"
+                % type(self).__name__)
         if len(linear.weight) < 2:
-            raise ValueError("TanhSequence requires a Linear with at least two weights")
+            raise ValueError(
+                "%s requires a Linear with at least two weights"
+                % type(self).__name__)
         self.linear = linear
         # Number of input features per row. d == 1 keeps the original scalar
         # sequence behavior (flat gradient lists); d > 1 switches the
@@ -370,7 +388,8 @@ class TanhSequence:
             owner = checkpoint._owner_ref()
             if owner is not self:
                 raise ValueError(
-                    "checkpoint belongs to a different TanhSequence instance")
+                    "checkpoint belongs to a different %s instance"
+                    % type(self).__name__)
             if not isinstance(checkpoint._width, int) \
                     or isinstance(checkpoint._width, bool) or checkpoint._width < 2:
                 fail()
@@ -580,8 +599,8 @@ class TanhSequence:
         # Portable counterpart of checkpoint(): captures exactly the same
         # state, but as an independent plain-data object (only dicts, lists,
         # finite numbers, booleans, strings and None) that is not tied to
-        # this instance and can migrate to any other TanhSequence wrapping a
-        # Linear of the same width. The call never mutates any state, and
+        # this instance and can migrate to any other instance of the same
+        # sequence class wrapping a Linear of the same width. The call never mutates any state, and
         # every mutable datum is freshly built, so the result shares no
         # reference with the instance or with any other export, survives
         # later computation, and round-trips through JSON unchanged. Boundary
@@ -605,7 +624,7 @@ class TanhSequence:
         stream = self._stream
         return {
             "version": _STATE_VERSION,
-            "kind": _STATE_KIND,
+            "kind": self._STATE_KIND,
             "width": self.d + 1,
             "hidden": self.hidden,
             "outputs": list(self.outputs),
@@ -658,7 +677,7 @@ class TanhSequence:
             fail()
         if version != _STATE_VERSION:
             raise ValueError("unsupported state version %r" % (version,))
-        if state["kind"] != _STATE_KIND:
+        if state["kind"] != self._STATE_KIND:
             fail()
         width = state["width"]
         if isinstance(width, bool) or not isinstance(width, int) or width < 2:
@@ -725,8 +744,8 @@ class TanhSequence:
                 "segment_start=True requires an active stream session; "
                 "call start_stream first")
         # Compute into a local first; only commit once the Linear forward and
-        # the tanh succeeded.
-        new_hidden = math.tanh(self.linear.forward(values + [self.hidden]))
+        # the activation succeeded.
+        new_hidden = self._activate(self.linear.forward(values + [self.hidden]))
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         # Continuing the trajectory stepwise mixes it with any recorded batch
@@ -777,7 +796,7 @@ class TanhSequence:
         saved_grad_bias = self.linear.grad_bias
         saved_boundaries = set(stream["boundaries"])
         try:
-            new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+            new_hidden = self._activate(self.linear.forward(values + [hidden]))
         except (TypeError, ValueError):
             self.hidden = saved_hidden
             self.outputs = saved_outputs
@@ -949,9 +968,10 @@ class TanhSequence:
                     boundaries.add(i)
                 prev_hiddens.append(hidden)
                 # Linear.forward rejects a non-finite pre-activation before
-                # caching anything, and math.tanh of a finite value is always
-                # finite, so every committed hidden/output value is finite.
-                hidden = math.tanh(self.linear.forward(x + [hidden]))
+                # caching anything, and the activation of a finite value is
+                # always finite, so every committed hidden/output value is
+                # finite.
+                hidden = self._activate(self.linear.forward(x + [hidden]))
                 inputs.append(x)
                 outputs.append(hidden)
         except (TypeError, ValueError):
@@ -1069,7 +1089,7 @@ class TanhSequence:
                 # terminal hidden-state gradient at the final step) still flows
                 # into the current step together with its own output gradient.
                 dh = grad_outputs[t] + hidden_grad
-                d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
+                d_pre = dh * self._activation_derivative(outputs[t])
 
                 # Parameter gradients at this step are always accumulated,
                 # including at segment starts (the detached carry value is
@@ -1134,3 +1154,36 @@ class TanhSequence:
         if return_initial:
             return input_grads, grad_initial_hidden
         return input_grads
+
+
+class SigmoidSequence(TanhSequence):
+    """Logistic-sigmoid counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is sigma(z) = 1 / (1 + exp(-z)) and the local derivative carried
+    through backward is output * (1 - output). Exported states carry a
+    distinct kind tag, so a TanhSequence state never migrates into a
+    SigmoidSequence (or vice versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "SigmoidSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # Numerically stable logistic sigmoid. For negative z the equivalent
+        # form exp(z) / (1 + exp(z)) keeps the exponential's argument
+        # negative, so no finite pre-activation can overflow it; both
+        # branches yield a finite value in (0, 1).
+        if z >= 0:
+            return 1.0 / (1.0 + math.exp(-z))
+        ez = math.exp(z)
+        return ez / (1.0 + ez)
+
+    @staticmethod
+    def _activation_derivative(output):
+        return output * (1.0 - output)
