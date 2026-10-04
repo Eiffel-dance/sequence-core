@@ -1187,3 +1187,45 @@ class SigmoidSequence(TanhSequence):
     @staticmethod
     def _activation_derivative(output):
         return output * (1.0 - output)
+
+
+class SoftplusSequence(TanhSequence):
+    """Softplus counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is softplus(z) = log(1 + exp(z)) and the local derivative carried
+    through backward is sigmoid(z) = 1 / (1 + exp(-z)). Exported states
+    carry a distinct kind tag ("SoftplusSequenceState"), so neither a
+    TanhSequence nor a SigmoidSequence state ever migrates into a
+    SoftplusSequence (or vice versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "SoftplusSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # Numerically stable softplus log(1 + exp(z)). The exponential's
+        # argument is kept non-positive in both branches, so no finite
+        # pre-activation can overflow it: for positive z the equivalent form
+        # z + log(1 + exp(-z)) is used, for non-positive z the plain
+        # log(1 + exp(z)). A huge positive z saturates to exactly z and a
+        # huge negative z to exactly 0.0; every finite input yields a finite
+        # non-negative output.
+        if z > 0:
+            return z + math.log1p(math.exp(-z))
+        return math.log1p(math.exp(z))
+
+    @staticmethod
+    def _activation_derivative(output):
+        # d softplus(z)/dz is sigmoid(z). With output = softplus(z),
+        # exp(-output) = 1 / (1 + exp(z)), so sigmoid(z) = 1 - exp(-output),
+        # which needs only the cached output. -expm1(-output) evaluates
+        # 1 - exp(-output) accurately even for tiny (saturated-negative)
+        # outputs, and output is non-negative so the exponential can never
+        # overflow.
+        return -math.expm1(-output)
