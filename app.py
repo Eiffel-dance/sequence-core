@@ -3,10 +3,31 @@ import weakref
 from collections.abc import Sequence
 
 
+def _is_finite(value):
+    """Return whether a non-bool int/float lies in the finite numeric domain.
+
+    NaN, positive/negative infinity and ints too large to convert to a finite
+    double (whose later use in float arithmetic would raise OverflowError) are
+    all treated as non-finite.
+    """
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _require_finite(value, what):
+    """Reject NaN, infinities and arithmetic-overflow-sized ints."""
+    if not _is_finite(value):
+        raise ValueError("%s must be a finite number" % what)
+    return value
+
+
 def _read_number(value, what):
     """Validate a scalar argument; bool is not accepted as a number."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError("%s must be a Python int or float" % what)
+    _require_finite(value, what)
     return value
 
 
@@ -25,6 +46,7 @@ def _read_number_sequence(values, expected_length, what):
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each element of %s must be an int or float" % what)
+        _require_finite(value, "each element of %s" % what)
         result.append(value)
     return result
 
@@ -44,6 +66,7 @@ def _read_row(row, width):
     for value in row:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each input value must be an int or float")
+        _require_finite(value, "each input value")
         values.append(value)
     return values
 
@@ -80,6 +103,7 @@ def _read_grad_list(values, expected_length):
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each output gradient must be a number")
+        _require_finite(value, "each output gradient")
         result.append(float(value))
     return result
 
@@ -100,7 +124,14 @@ class Linear:
 
     def forward(self, x):
         values = _read_number_sequence(x, len(self.weight), "x")
-        result = sum(w * a for w, a in zip(self.weight, values)) + self.bias
+        # Compute before caching anything. Overflow (e.g. an int+float sum
+        # beyond the double range) and a non-finite result are both rejected
+        # before the cache is touched.
+        try:
+            result = sum(w * a for w, a in zip(self.weight, values)) + self.bias
+        except OverflowError:
+            raise ValueError("linear output must be finite")
+        _require_finite(result, "linear output")
         # Cache only after validation and computation succeed. Record the
         # inputs together with the exact weights that produced the output.
         self.last = values
@@ -111,12 +142,26 @@ class Linear:
         if self.last is None:
             raise RuntimeError("backward requires a successful forward call first")
         _read_number(grad, "grad")
+        # Build every result into locals and verify finiteness before touching
+        # the accumulated parameter gradients, so a call whose arithmetic
+        # overflows leaves grad/grad_bias and the cache exactly as they were.
+        try:
+            new_grad = [g + grad * a for g, a in zip(self.grad, self.last)]
+            new_grad_bias = self.grad_bias + grad
+            input_grads = [grad * w for w in self._last_weight]
+        except OverflowError:
+            raise ValueError("backward result must be finite")
+        for value in new_grad:
+            _require_finite(value, "weight gradient")
+        _require_finite(new_grad_bias, "bias gradient")
+        for value in input_grads:
+            _require_finite(value, "input gradient")
         # Gradients are accumulated item by item across repeated calls, using
         # the cached inputs of the recorded forward pass.
-        self.grad = [g + grad * a for g, a in zip(self.grad, self.last)]
-        self.grad_bias += grad
+        self.grad = new_grad
+        self.grad_bias = new_grad_bias
         # Input gradients must use the weights as they were at forward time.
-        return [grad * w for w in self._last_weight]
+        return input_grads
 
     def zero_grad(self):
         self.grad = [0.0] * len(self.weight)
@@ -124,8 +169,18 @@ class Linear:
 
     def apply_gradients(self, learning_rate):
         _read_number(learning_rate, "learning_rate")
-        new_weight = [w - learning_rate * g for w, g in zip(self.weight, self.grad)]
-        new_bias = self.bias - learning_rate * self.grad_bias
+        # Compute the complete update locally and reject it unless every new
+        # parameter is finite; only then commit, so parameters are never
+        # partially written by a failed update.
+        try:
+            new_weight = [w - learning_rate * g
+                         for w, g in zip(self.weight, self.grad)]
+            new_bias = self.bias - learning_rate * self.grad_bias
+        except OverflowError:
+            raise ValueError("updated parameters must be finite")
+        for value in new_weight:
+            _require_finite(value, "updated weight")
+        _require_finite(new_bias, "updated bias")
         self.weight = new_weight
         self.bias = new_bias
 
@@ -270,10 +325,14 @@ class TanhSequence:
                     "Linear width %d"
                     % (checkpoint._width, len(self.linear.weight)))
 
-            # A scalar is any non-bool int/float.
+            # A scalar is any non-bool int/float; it must also lie in the
+            # finite numeric domain (no NaN, infinities or overflow-sized
+            # ints), otherwise restoring it could poison later arithmetic.
             def need_number(value):
                 if isinstance(value, bool) or not isinstance(value, (int, float)):
                     fail()
+                if not _is_finite(value):
+                    raise ValueError("checkpoint contains a non-finite numeric value")
 
             def need_number_list(value, length=None):
                 if not isinstance(value, list):
@@ -558,6 +617,12 @@ class TanhSequence:
         else:
             segment_flags = None
 
+        # Validate every input row (type, width and finite domain) up front,
+        # before any state, cache or Linear forward record is touched, so a
+        # batch containing a bad row anywhere can never leave a partial
+        # trajectory.
+        validated_rows = [_read_row(row, self.d) for row in rows]
+
         # Snapshot every piece of observable state the traversal may touch so
         # that any failure rolls the sequence back to its pre-call state: a
         # rejected traversal must leave neither a half-advanced hidden state
@@ -585,7 +650,7 @@ class TanhSequence:
         # initial_hidden as the current hidden state with empty outputs.
         hidden = initial_hidden
         try:
-            for i, row in enumerate(rows):
+            for i, x in enumerate(validated_rows):
                 declared = segment_flags is not None and segment_flags[i]
                 if (truncate is not None and i % truncate == 0) or declared:
                     # Segment start. The very first segment starts from
@@ -605,8 +670,10 @@ class TanhSequence:
                     else:
                         hidden = initial_hidden
                     boundaries.add(i)
-                x = _read_row(row, self.d)
                 prev_hiddens.append(hidden)
+                # Linear.forward rejects a non-finite pre-activation before
+                # caching anything, and math.tanh of a finite value is always
+                # finite, so every committed hidden/output value is finite.
                 hidden = math.tanh(self.linear.forward(x + [hidden]))
                 inputs.append(x)
                 outputs.append(hidden)
@@ -693,6 +760,12 @@ class TanhSequence:
         grad_outputs = _read_grad_list(grad_outputs, n)
         grad_hidden = _read_number(grad_hidden, "grad_hidden")
 
+        # Accumulate this pass entirely into locals and commit to the Linear
+        # only once every produced value is finite, so an overflowing pass
+        # never leaves partially accumulated parameter gradients.
+        param_grad = list(self.linear.grad)
+        param_grad_bias = self.linear.grad_bias
+
         input_grads = [0.0] * n
         # Hidden-state gradients recorded at segment starts past index 0, in
         # traversal (descending) order; reversed into ascending order below.
@@ -705,45 +778,70 @@ class TanhSequence:
         # An empty cached sequence has no steps: return the terminal gradient
         # unchanged (as provided) without touching any parameter gradient.
         grad_initial_hidden = grad_hidden if n == 0 else 0.0
-        for t in range(n - 1, -1, -1):
-            # Gradient from later steps *within this segment* (including the
-            # terminal hidden-state gradient at the final step) still flows
-            # into the current step together with its own output gradient.
-            dh = grad_outputs[t] + hidden_grad
-            d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
+        try:
+            for t in range(n - 1, -1, -1):
+                # Gradient from later steps *within this segment* (including the
+                # terminal hidden-state gradient at the final step) still flows
+                # into the current step together with its own output gradient.
+                dh = grad_outputs[t] + hidden_grad
+                d_pre = dh * (1.0 - outputs[t] * outputs[t])  # tanh derivative
 
-            # Parameter gradients at this step are always accumulated,
-            # including at segment starts (the detached carry value is treated
-            # as a constant and enters this local derivative only).
-            row = inputs[t]
-            for k in range(d):
-                self.linear.grad[k] += d_pre * row[k]
-            self.linear.grad[d] += d_pre * prev_hiddens[t]
-            self.linear.grad_bias += d_pre
+                # Parameter gradients at this step are always accumulated,
+                # including at segment starts (the detached carry value is
+                # treated as a constant and enters this local derivative only).
+                row = inputs[t]
+                for k in range(d):
+                    param_grad[k] += d_pre * row[k]
+                param_grad[d] += d_pre * prev_hiddens[t]
+                param_grad_bias += d_pre
 
-            # Input gradients mirror the input shape: one row of d gradients
-            # per step for a multi-feature sequence, and the original flat
-            # scalar list when d == 1.
-            row_grads = [d_pre * w for w in w_inputs]
-            input_grads[t] = row_grads[0] if d == 1 else row_grads
-            # Step 0 always consumes initial_hidden as its previous hidden
-            # state. With truncation the boundary cut below severs later
-            # segments, so this local term is the full gradient with respect
-            # to initial_hidden; without truncation it is reached uncut.
-            if t == 0:
-                grad_initial_hidden = d_pre * w_hidden
-            if t in boundaries:
-                # Truncated BPTT: segment-start hidden values (zeroed or
-                # carried as detached numbers) are constants, so no gradient
-                # crosses back into the prior segment. For a start past
-                # index 0, d_pre * w_hidden is the total gradient the merged
-                # within-segment recurrence delivers to that detached
-                # boundary constant; record it before severing the link.
-                if return_boundaries and t > 0:
-                    boundary_grads.append((t, d_pre * w_hidden))
-                hidden_grad = 0.0
+                # Input gradients mirror the input shape: one row of d gradients
+                # per step for a multi-feature sequence, and the original flat
+                # scalar list when d == 1.
+                row_grads = [d_pre * w for w in w_inputs]
+                input_grads[t] = row_grads[0] if d == 1 else row_grads
+                # Step 0 always consumes initial_hidden as its previous hidden
+                # state. With truncation the boundary cut below severs later
+                # segments, so this local term is the full gradient with respect
+                # to initial_hidden; without truncation it is reached uncut.
+                if t == 0:
+                    grad_initial_hidden = d_pre * w_hidden
+                if t in boundaries:
+                    # Truncated BPTT: segment-start hidden values (zeroed or
+                    # carried as detached numbers) are constants, so no gradient
+                    # crosses back into the prior segment. For a start past
+                    # index 0, d_pre * w_hidden is the total gradient the merged
+                    # within-segment recurrence delivers to that detached
+                    # boundary constant; record it before severing the link.
+                    if return_boundaries and t > 0:
+                        boundary_grads.append((t, d_pre * w_hidden))
+                    hidden_grad = 0.0
+                else:
+                    hidden_grad = d_pre * w_hidden
+        except OverflowError:
+            raise ValueError("backward result must be finite")
+
+        # Verify the whole pass produced finite numbers before committing any
+        # of it: non-finite parameter gradients, input gradients, seeds or
+        # boundary gradients are all rejected with state untouched.
+        def _check(value):
+            _require_finite(value, "gradient")
+
+        for value in param_grad:
+            _check(value)
+        _check(param_grad_bias)
+        _check(grad_initial_hidden)
+        for value in input_grads:
+            if isinstance(value, list):
+                for item in value:
+                    _check(item)
             else:
-                hidden_grad = d_pre * w_hidden
+                _check(value)
+        for _, value in boundary_grads:
+            _check(value)
+
+        self.linear.grad = param_grad
+        self.linear.grad_bias = param_grad_bias
 
         if return_boundaries:
             boundary_grads.reverse()
