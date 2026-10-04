@@ -1263,3 +1263,47 @@ class ReLUSequence(TanhSequence):
         # wherever z > 0, so it alone decides the branch: derivative 0 at
         # zero output, 1 at positive output.
         return 1.0 if output > 0 else 0.0
+
+
+class LeakyReLUSequence(TanhSequence):
+    """Leaky rectified-linear counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is leaky_relu(z) with the fixed negative slope 0.01 — exactly z
+    for z > 0, exactly 0.0 for z == 0, and 0.01 * z for z < 0 — and the
+    local derivative carried through backward is 1.0 where the cached output
+    is positive and 0.01 where it is zero or negative. The slope is not
+    configurable: the constructor takes only the Linear, exactly like the
+    other sequence classes. Exported states carry a distinct kind tag
+    ("LeakyReLUSequenceState"), so a state of any other sequence class never
+    migrates into a LeakyReLUSequence (or vice versa); the version rule is
+    unchanged.
+    """
+
+    _STATE_KIND = "LeakyReLUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # The pre-activation is already validated finite by Linear.forward.
+        # Multiplication by 0.01 only shrinks the magnitude (underflow to a
+        # subnormal or zero stays finite), so every finite input yields a
+        # finite output with no overflow path. z == 0 (including -0.0)
+        # returns the exact zero constant rather than a signed product.
+        if z > 0:
+            return z
+        if z == 0:
+            return 0.0
+        return 0.01 * z
+
+    @staticmethod
+    def _activation_derivative(output):
+        # The cached output equals z wherever z > 0, is exactly 0.0 at
+        # z == 0 and equals 0.01 * z (strictly negative) wherever z < 0, so
+        # it alone decides the branch: derivative 1 at positive output, the
+        # fixed slope 0.01 at zero or negative output.
+        return 1.0 if output > 0 else 0.01
