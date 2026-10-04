@@ -184,6 +184,58 @@ class Linear:
         self.weight = new_weight
         self.bias = new_bias
 
+    def clip_gradients(self, max_norm):
+        # Explicit gradient-clipping entry point for the CPU training loop:
+        # grad and grad_bias are treated as one vector and limited as a whole
+        # by the global L2 norm (no per-component clipping). Everything is
+        # validated and computed into locals first; a rejected call leaves
+        # grad/grad_bias exactly as they were, and no other state (weight,
+        # bias, the forward cache, or any TanhSequence state) is ever touched.
+        if isinstance(max_norm, bool) or not isinstance(max_norm, (int, float)):
+            raise ValueError("max_norm must be a Python int or float")
+        _require_finite(max_norm, "max_norm")
+        if max_norm < 0:
+            raise ValueError("max_norm must be non-negative")
+        # The accumulated gradients are validated as a whole before any
+        # arithmetic: a non-numeric or non-finite component anywhere rejects
+        # the call with both gradient fields untouched.
+        components = []
+        for value in self.grad:
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise ValueError("each element of grad must be an int or float")
+            _require_finite(value, "each element of grad")
+            components.append(value)
+        if isinstance(self.grad_bias, bool) \
+                or not isinstance(self.grad_bias, (int, float)):
+            raise ValueError("grad_bias must be an int or float")
+        _require_finite(self.grad_bias, "grad_bias")
+        components.append(self.grad_bias)
+        # Global L2 norm by its mathematical definition. math.hypot evaluates
+        # sqrt of the sum of squares without a squaring intermediate, so a
+        # finite component whose square would overflow the double range still
+        # yields the correct observable norm instead of a spurious overflow.
+        norm = math.hypot(*components)
+        _require_finite(norm, "gradient norm")
+        # A zero norm means every component is already zero, and any norm
+        # within the limit needs no scaling; both leave the gradients exactly
+        # as they are.
+        if norm <= max_norm:
+            return 1.0
+        # Scale every component by the same ratio. A zero max_norm with a
+        # nonzero norm scales everything to exactly zero and reports 0.0.
+        scale = max_norm / norm
+        try:
+            new_grad = [g * scale for g in self.grad]
+            new_grad_bias = self.grad_bias * scale
+        except OverflowError:
+            raise ValueError("clipped gradients must be finite")
+        for value in new_grad:
+            _require_finite(value, "clipped weight gradient")
+        _require_finite(new_grad_bias, "clipped bias gradient")
+        self.grad = new_grad
+        self.grad_bias = new_grad_bias
+        return scale
+
 
 class _Checkpoint:
     # Immutable-looking snapshot container returned by TanhSequence.checkpoint.
