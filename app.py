@@ -902,7 +902,12 @@ class TanhSequence:
             "carry_hidden": carry_hidden,
             "weights": weights,
         }
-        return self.outputs
+        # Return an independent list: the caller may freely mutate (assign,
+        # append, delete, clear) the result without reaching self.outputs,
+        # self.hidden, or the cached forward pass used by backward(). The
+        # elements are immutable floats, so a shallow copy fully detaches
+        # the returned object from every later call's return value as well.
+        return list(self.outputs)
 
     def backward(self, grad_outputs):
         # Terminal hidden-state gradient is zero, so this is exactly the
