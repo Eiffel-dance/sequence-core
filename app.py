@@ -1187,3 +1187,42 @@ class SigmoidSequence(TanhSequence):
     @staticmethod
     def _activation_derivative(output):
         return output * (1.0 - output)
+
+
+class SoftplusSequence(TanhSequence):
+    """Softplus sequence unit: log(1 + exp(z)) applied to the shared recurrence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is softplus(z) = log(1 + exp(z)) and the local derivative carried
+    through backward is sigmoid(z) = 1 / (1 + exp(-z)). Exported states carry
+    a distinct kind tag, so a TanhSequence or SigmoidSequence state never
+    migrates into a SoftplusSequence (or vice versa); the version rule is
+    unchanged.
+    """
+
+    _STATE_KIND = "SoftplusSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # Numerically stable softplus. For positive z the equivalent form
+        # z + log1p(exp(-z)) keeps the exponential's argument negative, so no
+        # finite pre-activation can overflow it; for non-positive z exp(z)
+        # is at most 1 and log1p is exact near zero. Both branches yield a
+        # finite, non-negative value.
+        if z > 0:
+            return z + math.log1p(math.exp(-z))
+        return math.log1p(math.exp(z))
+
+    @staticmethod
+    def _activation_derivative(output):
+        # sigmoid(z) expressed in the cached output: since
+        # output = log(1 + exp(z)), exp(-output) = 1 / (1 + exp(z)) and
+        # sigmoid(z) = 1 - exp(-output). The expm1 form stays accurate for
+        # outputs near zero, and exp(-output) never overflows because the
+        # softplus output is always non-negative.
+        return -math.expm1(-output)
