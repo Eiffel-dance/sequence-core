@@ -743,7 +743,8 @@ class TanhSequence:
         i = len(stream["inputs"])
         truncate = stream["truncate"]
         truncate_boundary = truncate is not None and i % truncate == 0
-        if truncate_boundary or segment_start:
+        is_boundary = truncate_boundary or segment_start
+        if is_boundary:
             # Segment start. The first segment starts from the session's
             # initial hidden state; without carry every later segment resets
             # to zero; with carry it starts from a numeric copy of the
@@ -757,10 +758,17 @@ class TanhSequence:
                 hidden = float(stream["outputs"][-1])
             else:
                 hidden = 0.0
-            stream["boundaries"].add(i)
         else:
             hidden = self.hidden
+        # Compute into a local first. Linear.forward validates and computes
+        # before caching anything, so a rejected step (overflowing or
+        # otherwise non-finite linear output) raises before this line
+        # commits; the boundary mark, hidden state, public outputs and the
+        # recorded trajectory are only appended once the whole step
+        # succeeded, leaving no half-forward trace behind.
         new_hidden = math.tanh(self.linear.forward(values + [hidden]))
+        if is_boundary:
+            stream["boundaries"].add(i)
         self.hidden = new_hidden
         self.outputs.append(new_hidden)
         stream["inputs"].append(values)
