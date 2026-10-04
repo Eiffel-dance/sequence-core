@@ -391,23 +391,65 @@ class TanhSequence:
                     if not isinstance(index, int) or isinstance(index, bool) \
                             or not 0 <= index < n:
                         fail()
+                # Every periodic boundary implied by truncate must be present;
+                # a genuine traversal never skips one (explicitly declared
+                # starts may only add further boundaries).
+                if truncate is not None:
+                    for index in range(0, n, truncate):
+                        if index not in record["boundaries"]:
+                            fail()
+                # Step-by-step correspondence of the recorded recurrence:
+                # past step 0 a non-boundary step continues from the previous
+                # step's output, while a nonzero boundary follows the
+                # carry_hidden rule (a detached copy of the previous
+                # segment's last output when carrying, the zero constant
+                # otherwise). Step 0 consumes the pass's initial hidden
+                # state, which a batch record does not store, so it cannot be
+                # cross-checked here.
+                for t in range(1, n):
+                    if t in record["boundaries"] and not record["carry_hidden"]:
+                        expected = 0.0
+                    else:
+                        expected = record["outputs"][t - 1]
+                    if record["prev_hiddens"][t] != expected:
+                        fail()
                 return record, n
 
-            # The committed batch pass. Its outputs must equal the visible
-            # outputs captured at checkpoint time.
+            # A checkpoint never holds both a committed batch pass and an
+            # open stream session: opening a session discards the batch
+            # record, and a successful batch forward closes any session.
             fwd_record = checkpoint._fwd
+            stream = checkpoint._stream
+            if fwd_record is not None and stream is not None:
+                fail()
+
+            # The committed batch pass. Its outputs must equal the visible
+            # outputs captured at checkpoint time, and a non-empty trajectory
+            # fixes the public hidden state at its last output.
             if fwd_record is not None:
                 validate_trajectory(fwd_record, set())
                 if fwd_record["outputs"] != checkpoint._outputs:
                     fail()
+                if fwd_record["outputs"] \
+                        and checkpoint._hidden != fwd_record["outputs"][-1]:
+                    fail()
 
             # The open stream session (None when no session was active).
-            stream = checkpoint._stream
             if stream is not None:
                 validate_trajectory(stream, {"initial_hidden"})
                 need_number(stream["initial_hidden"])
                 # An open session is always reflected in the visible outputs.
                 if stream["outputs"] != checkpoint._outputs:
+                    fail()
+                if stream["outputs"]:
+                    if checkpoint._hidden != stream["outputs"][-1]:
+                        fail()
+                    # Step 0 of a session always consumes the session's
+                    # initial hidden state.
+                    if stream["prev_hiddens"][0] != stream["initial_hidden"]:
+                        fail()
+                elif checkpoint._hidden != stream["initial_hidden"]:
+                    # An empty session has not advanced past its seed.
                     fail()
 
         # All validation happens before any state is touched, so a rejected
