@@ -358,7 +358,10 @@ class TanhSequence:
                     fail()
                 need_number_list(checkpoint._linear_last_weight, width)
 
-            def validate_trajectory(record, extra_keys):
+            def validate_trajectory(record, extra_keys, expect_initial=False):
+                # Structural validation first: exact key set, scalar/list
+                # types, finite numeric domain, equal per-step lengths and
+                # boundary indices inside the valid range.
                 if record is None:
                     return
                 if not isinstance(record, dict):
@@ -391,23 +394,77 @@ class TanhSequence:
                     if not isinstance(index, int) or isinstance(index, bool) \
                             or not 0 <= index < n:
                         fail()
-                return record, n
+                # Open-stream records alone remember the session's starting
+                # hidden state; read it only once the exact key set above has
+                # been confirmed.
+                initial_hidden = None
+                if expect_initial:
+                    initial_hidden = record["initial_hidden"]
+                    need_number(initial_hidden)
+                # Semantic validation: the arrays must describe one and the
+                # same traversal. Every period the truncate rule cuts must be
+                # present in the boundary set (explicit starts may add more),
+                # and each prev_hiddens entry must be the value that step
+                # actually consumed: a stream's first step consumes its
+                # initial_hidden; a nonzero boundary consumes the previous
+                # segment's last output when carrying, else exactly zero;
+                # every other step continues from the previous output.
+                boundaries = record["boundaries"]
+                if truncate is not None:
+                    for index in range(n):
+                        if index % truncate == 0 and index not in boundaries:
+                            fail()
+                outputs = record["outputs"]
+                prev_hiddens = record["prev_hiddens"]
+                carry = record["carry_hidden"]
+                for t in range(n):
+                    if t == 0:
+                        # Only open-stream records remember the session's
+                        # initial_hidden; a committed batch record has no
+                        # stored starting value to compare step 0 against.
+                        if initial_hidden is not None \
+                                and prev_hiddens[0] != initial_hidden:
+                            fail()
+                    elif t in boundaries:
+                        expected = outputs[t - 1] if carry else 0.0
+                        if prev_hiddens[t] != expected:
+                            fail()
+                    elif prev_hiddens[t] != outputs[t - 1]:
+                        fail()
+
+            # The committed batch pass and an open stream session are mutually
+            # exclusive in live state, so a checkpoint carrying both could
+            # never have been produced and is rejected outright.
+            fwd_record = checkpoint._fwd
+            stream = checkpoint._stream
+            if fwd_record is not None and stream is not None:
+                fail()
 
             # The committed batch pass. Its outputs must equal the visible
             # outputs captured at checkpoint time.
-            fwd_record = checkpoint._fwd
             if fwd_record is not None:
                 validate_trajectory(fwd_record, set())
                 if fwd_record["outputs"] != checkpoint._outputs:
                     fail()
 
             # The open stream session (None when no session was active).
-            stream = checkpoint._stream
             if stream is not None:
-                validate_trajectory(stream, {"initial_hidden"})
-                need_number(stream["initial_hidden"])
+                validate_trajectory(stream, {"initial_hidden"},
+                                    expect_initial=True)
                 # An open session is always reflected in the visible outputs.
                 if stream["outputs"] != checkpoint._outputs:
+                    fail()
+
+            # The public hidden state must agree with the visible trajectory:
+            # it is the last produced output whenever one exists; an empty open
+            # session still sits exactly at its initial_hidden. With no
+            # trajectory and no open session the finite-domain check above is
+            # all the hidden slot can be judged against.
+            if checkpoint._outputs:
+                if checkpoint._hidden != checkpoint._outputs[-1]:
+                    fail()
+            elif stream is not None:
+                if checkpoint._hidden != stream["initial_hidden"]:
                     fail()
 
         # All validation happens before any state is touched, so a rejected
