@@ -129,6 +129,206 @@ class Linear:
         self.bias = new_bias
 
 
+# ---------------------------------------------------------------------------
+# Resumable checkpoints for TanhSequence
+# ---------------------------------------------------------------------------
+
+_sequence_uid_counter = 0
+
+
+def _next_sequence_uid():
+    global _sequence_uid_counter
+    _sequence_uid_counter += 1
+    return _sequence_uid_counter
+
+
+class _TanhSequenceCheckpoint:
+    """Opaque, instance-bound snapshot returned by ``TanhSequence.checkpoint()``.
+
+    The payload holds independent copies only: it shares no mutable reference
+    with the sequence or its wrapped Linear, and restore() copies the payload
+    again, so one checkpoint can be restored any number of times without ever
+    being mutated by the instance it restores.
+    """
+
+    __slots__ = ("_owner", "_width", "_payload")
+
+    def __init__(self, owner, width, payload):
+        self._owner = owner
+        self._width = width
+        self._payload = payload
+
+
+def _checkpoint_number(value, what):
+    # Trajectory values are always floats, but Linear weights and a stream's
+    # initial_hidden may legitimately be ints; bool (an int subclass) never
+    # appears in a genuine checkpoint and is treated as corruption.
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("corrupt checkpoint: %s must be a number" % what)
+    return value
+
+
+def _checkpoint_number_list(values, length, what):
+    if not isinstance(values, list):
+        raise ValueError("corrupt checkpoint: %s must be a list" % what)
+    if len(values) != length:
+        raise ValueError("corrupt checkpoint: %s has the wrong length" % what)
+    return [_checkpoint_number(value, "%s element" % what) for value in values]
+
+
+def _checkpoint_truncate(value, what):
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            "corrupt checkpoint: %s must be a positive integer or None" % what)
+    return value
+
+
+def _checkpoint_boundaries(values, length, what):
+    if not isinstance(values, set):
+        raise ValueError("corrupt checkpoint: %s must be a set" % what)
+    result = set()
+    for value in values:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("corrupt checkpoint: %s must hold integers" % what)
+        if not 0 <= value < length:
+            raise ValueError("corrupt checkpoint: %s index out of range" % what)
+        result.add(value)
+    return result
+
+
+def _snapshot_pass(record, include_initial):
+    """Deep-copy one cached batch pass or open stream-session record."""
+    data = {
+        "inputs": [list(row) for row in record["inputs"]],
+        "prev_hiddens": list(record["prev_hiddens"]),
+        "outputs": list(record["outputs"]),
+        "boundaries": set(record["boundaries"]),
+        "truncate": record["truncate"],
+        "carry_hidden": record["carry_hidden"],
+        "weights": list(record["weights"]),
+    }
+    if include_initial:
+        data["initial_hidden"] = record["initial_hidden"]
+    return data
+
+
+def _build_pass(data, width, what, include_initial):
+    """Validate a checkpointed pass/stream record and rebuild it as fresh
+    containers. Reads checkpoint data only and never touches live state, so
+    raising here cannot change the instance."""
+    if not isinstance(data, dict):
+        raise ValueError("corrupt checkpoint: %s must be a record" % what)
+    required = ["inputs", "prev_hiddens", "outputs", "boundaries",
+                "truncate", "carry_hidden", "weights"]
+    if include_initial:
+        required.append("initial_hidden")
+    for key in required:
+        if key not in data:
+            raise ValueError(
+                "corrupt checkpoint: %s is missing %s" % (what, key))
+    raw_outputs = data["outputs"]
+    if not isinstance(raw_outputs, list):
+        raise ValueError("corrupt checkpoint: %s outputs must be a list" % what)
+    n = len(raw_outputs)
+    outputs = [_checkpoint_number(value, "%s output" % what)
+               for value in raw_outputs]
+    prev_hiddens = _checkpoint_number_list(
+        data["prev_hiddens"], n, "%s prev_hiddens" % what)
+    raw_inputs = data["inputs"]
+    if not isinstance(raw_inputs, list) or len(raw_inputs) != n:
+        raise ValueError(
+            "corrupt checkpoint: %s inputs have the wrong shape" % what)
+    inputs = [
+        _checkpoint_number_list(row, width - 1, "%s input row" % what)
+        for row in raw_inputs
+    ]
+    boundaries = _checkpoint_boundaries(
+        data["boundaries"], n, "%s boundaries" % what)
+    truncate = _checkpoint_truncate(data["truncate"], "%s truncate" % what)
+    carry_hidden = data["carry_hidden"]
+    if not isinstance(carry_hidden, bool):
+        raise ValueError(
+            "corrupt checkpoint: %s carry_hidden must be a bool" % what)
+    weights = _checkpoint_number_list(
+        data["weights"], width, "%s weights" % what)
+    record = {
+        "inputs": inputs,
+        "prev_hiddens": prev_hiddens,
+        "outputs": outputs,
+        "boundaries": boundaries,
+        "truncate": truncate,
+        "carry_hidden": carry_hidden,
+        "weights": weights,
+    }
+    if include_initial:
+        record["initial_hidden"] = _checkpoint_number(
+            data["initial_hidden"], "%s initial_hidden" % what)
+    return record
+
+
+_CHECKPOINT_KEYS = ("version", "hidden", "outputs", "fwd", "stream",
+                    "weight", "bias", "grad", "grad_bias",
+                    "last", "last_weight")
+
+
+def _build_checkpoint_payload(payload, width):
+    """Validate the whole checkpoint payload and return an independent,
+    fully rebuilt copy of every restorable piece of state."""
+    if not isinstance(payload, dict):
+        raise ValueError("corrupt checkpoint: payload must be a record")
+    for key in _CHECKPOINT_KEYS:
+        if key not in payload:
+            raise ValueError("corrupt checkpoint: payload is missing %s" % key)
+    if payload["version"] != 1:
+        raise ValueError("corrupt checkpoint: unsupported checkpoint version")
+    hidden = _checkpoint_number(payload["hidden"], "hidden")
+    raw_outputs = payload["outputs"]
+    if not isinstance(raw_outputs, list):
+        raise ValueError("corrupt checkpoint: outputs must be a list")
+    outputs = [_checkpoint_number(value, "output") for value in raw_outputs]
+    fwd_data = payload["fwd"]
+    fwd = (None if fwd_data is None
+           else _build_pass(fwd_data, width, "forward cache", False))
+    stream_data = payload["stream"]
+    stream = (None if stream_data is None
+              else _build_pass(stream_data, width, "stream", True))
+    weight = _checkpoint_number_list(payload["weight"], width, "weight")
+    bias = _checkpoint_number(payload["bias"], "bias")
+    grad = _checkpoint_number_list(payload["grad"], width, "accumulated grad")
+    grad_bias = _checkpoint_number(
+        payload["grad_bias"], "accumulated bias grad")
+    last_data = payload["last"]
+    last_weight_data = payload["last_weight"]
+    # The Linear's successful-forward cache always stores the input row and
+    # the forward-time weights together, or neither.
+    if last_data is None or last_weight_data is None:
+        if last_data is not None or last_weight_data is not None:
+            raise ValueError(
+                "corrupt checkpoint: last and last_weight must both be set "
+                "or both be None")
+        last = None
+        last_weight = None
+    else:
+        last = _checkpoint_number_list(
+            last_data, width, "last forward input")
+        last_weight = _checkpoint_number_list(
+            last_weight_data, width, "last forward weight")
+    return {
+        "hidden": hidden,
+        "outputs": outputs,
+        "fwd": fwd,
+        "stream": stream,
+        "weight": weight,
+        "bias": bias,
+        "grad": grad,
+        "grad_bias": grad_bias,
+        "last": last,
+        "last_weight": last_weight,
+    }
+
+
 class TanhSequence:
     def __init__(self, linear):
         # A Linear with at least two weights: the first d = len(weight) - 1
@@ -145,6 +345,9 @@ class TanhSequence:
         # sequence behavior (flat gradient lists); d > 1 switches the
         # backward entries to nested per-feature rows.
         self.d = len(linear.weight) - 1
+        # Identity tag binding a checkpoint to exactly this instance; used to
+        # reject checkpoints produced by any other TanhSequence.
+        self._uid = _next_sequence_uid()
         self.hidden = 0.0
         self.outputs = []
         self._fwd = None
@@ -160,6 +363,67 @@ class TanhSequence:
         self._fwd = None
         # Any half-finished stream session is abandoned as well.
         self._stream = None
+
+    def checkpoint(self):
+        # Pure read: nothing about the sequence or its wrapped Linear is
+        # mutated. Deep copies at every level mean the returned object shares
+        # no mutable reference with the instance, and the same checkpoint can
+        # be restored any number of times.
+        payload = {
+            "version": 1,
+            "hidden": self.hidden,
+            "outputs": list(self.outputs),
+            "fwd": None if self._fwd is None else _snapshot_pass(self._fwd, False),
+            "stream": (None if self._stream is None
+                       else _snapshot_pass(self._stream, True)),
+            # The wrapped Linear's parameters at checkpoint time, its
+            # accumulated parameter/bias gradients, and its last successful
+            # forward cache (inputs plus the exact weights that produced it).
+            "weight": list(self.linear.weight),
+            "bias": self.linear.bias,
+            "grad": list(self.linear.grad),
+            "grad_bias": self.linear.grad_bias,
+            "last": None if self.linear.last is None else list(self.linear.last),
+            "last_weight": (None if self.linear._last_weight is None
+                            else list(self.linear._last_weight)),
+        }
+        return _TanhSequenceCheckpoint(self._uid, len(self.linear.weight), payload)
+
+    def restore(self, checkpoint):
+        # Validate entirely against local rebuilt data first; until the commit
+        # below nothing in this instance or its Linear is touched, so a
+        # rejected restore (corrupt payload, foreign instance, incompatible
+        # width) leaves every observable value exactly as it was.
+        if not isinstance(checkpoint, _TanhSequenceCheckpoint):
+            raise ValueError(
+                "restore requires a checkpoint produced by TanhSequence.checkpoint()")
+        if checkpoint._owner != self._uid:
+            raise ValueError(
+                "cannot restore a checkpoint created by another TanhSequence")
+        width = len(self.linear.weight)
+        if checkpoint._width != width:
+            raise ValueError(
+                "checkpoint width %d is incompatible with the current "
+                "Linear width %d" % (checkpoint._width, width))
+        try:
+            state = _build_checkpoint_payload(checkpoint._payload, width)
+        except ValueError:
+            raise
+        # Atomic commit: every assignment below is a plain reference replacement
+        # to the already-built copies, with no further validation or possible
+        # failure. An open (even half-finished) stream session is simply
+        # overwritten by the checkpointed one.
+        self.hidden = state["hidden"]
+        self.outputs = state["outputs"]
+        self._fwd = state["fwd"]
+        self._stream = state["stream"]
+        self.linear.weight = state["weight"]
+        self.linear.bias = state["bias"]
+        self.linear.grad = state["grad"]
+        self.linear.grad_bias = state["grad_bias"]
+        self.linear.last = state["last"]
+        self.linear._last_weight = state["last_weight"]
+        return None
 
     def step(self, row, segment_start=False):
         # Validate before any state is touched, so a rejected row changes
