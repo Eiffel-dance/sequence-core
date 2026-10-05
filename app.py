@@ -1917,3 +1917,48 @@ class GELUSequence(TanhSequence):
             pres_fwd=pres_fwd,
             pres_stream=pres_stream,
         )
+
+
+class ELUSequence(TanhSequence):
+    """Exponential-linear counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is elu(z) with the fixed alpha 1 — exactly z for z >= 0 and
+    expm1(z) = exp(z) - 1 for z < 0, with z == 0 yielding the exact zero
+    constant — and the local derivative carried through backward is 1 where
+    z > 0 and exp(z) where z <= 0. The slope alpha is not configurable: the
+    constructor takes only the Linear, exactly like the other sequence
+    classes. Exported states carry a distinct kind tag ("ELUSequenceState"),
+    so a state of any other sequence class never migrates into an
+    ELUSequence (or vice versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "ELUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # The pre-activation is already validated finite by Linear.forward.
+        # For negative z the exponential's argument stays negative, so
+        # expm1(z) lies in [-1, 0) and no finite input can overflow; every
+        # finite input yields a finite output. z == 0 (including -0.0)
+        # returns the exact zero constant rather than a signed passthrough.
+        if z > 0:
+            return z
+        if z == 0:
+            return 0.0
+        return math.expm1(z)
+
+    @staticmethod
+    def _activation_derivative(output):
+        # The cached output equals z wherever z > 0 and equals expm1(z)
+        # (strictly negative, or exactly 0.0 at z == 0) wherever z <= 0, so
+        # it alone decides the branch: derivative 1 at positive output, and
+        # exp(z) == 1 + expm1(z) == 1 + output at zero or negative output.
+        # The output of the negative branch lies in [-1, 0], so the sum
+        # lies in [0, 1] and is always finite.
+        return 1.0 if output > 0 else 1.0 + output
