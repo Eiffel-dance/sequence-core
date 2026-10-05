@@ -86,6 +86,37 @@ def _read_bool_sequence(values, what):
     return result
 
 
+def _read_segment_hiddens(values, expected_length, what):
+    """Validate an optional per-row sequence of boundary hidden-state seeds.
+
+    Each element is either None (the step follows the standard boundary
+    rules) or a finite non-bool int/float (the detached hidden-state constant
+    that step consumes). Positions are checked against the boundary set by
+    the caller.
+    """
+    if isinstance(values, (str, bytes, bytearray, memoryview)):
+        raise ValueError(
+            "%s must be a non-text, non-bytes sequence of numbers or None"
+            % what)
+    if not isinstance(values, Sequence):
+        raise ValueError("%s must be a sequence of numbers or None" % what)
+    if len(values) != expected_length:
+        raise ValueError(
+            "%s length %d does not match rows length %d"
+            % (what, len(values), expected_length))
+    result = []
+    for value in values:
+        if value is None:
+            result.append(None)
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                "each element of %s must be None or an int or float" % what)
+        _require_finite(value, "each element of %s" % what)
+        result.append(value)
+    return result
+
+
 def _read_grad_list(values, expected_length):
     """Validate an output-gradient list and return it as a list of floats."""
     if isinstance(values, (str, bytes, bytearray, memoryview)):
@@ -261,10 +292,13 @@ class _Checkpoint:
         self._linear_last_weight = linear_last_weight
 
 
-# Version of the portable state format produced by export_state(). Only
-# version 1 exists; import_state rejects anything else. The rule is shared by
-# every sequence class.
-_STATE_VERSION = 1
+# Version of the portable state format produced by export_state(). Version 2
+# adds the per-step boundary hidden-state seeds ("segment_hiddens") to every
+# trajectory record; version 1 states (without them) are still accepted on
+# import, their missing seeds interpreted as None. Anything else is rejected.
+# The rule is shared by every sequence class.
+_STATE_VERSION = 2
+_SUPPORTED_STATE_VERSIONS = (1, 2)
 
 
 class TanhSequence:
@@ -339,6 +373,7 @@ class TanhSequence:
                 "truncate": fwd["truncate"],
                 "carry_hidden": fwd["carry_hidden"],
                 "weights": list(fwd["weights"]),
+                "segment_hiddens": list(fwd["segment_hiddens"]),
             }
         stream = self._stream
         if stream is None:
@@ -353,6 +388,7 @@ class TanhSequence:
                 "carry_hidden": stream["carry_hidden"],
                 "initial_hidden": stream["initial_hidden"],
                 "weights": list(stream["weights"]),
+                "segment_hiddens": list(stream["segment_hiddens"]),
             }
         return _Checkpoint(
             owner_ref=weakref.ref(self),
@@ -441,7 +477,8 @@ class TanhSequence:
                 if not isinstance(record, dict):
                     fail()
                 keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
-                        "truncate", "carry_hidden", "weights"} | extra_keys
+                        "truncate", "carry_hidden", "weights",
+                        "segment_hiddens"} | extra_keys
                 if set(record.keys()) != keys:
                     fail()
                 truncate = record["truncate"]
@@ -468,6 +505,19 @@ class TanhSequence:
                     if not isinstance(index, int) or isinstance(index, bool) \
                             or not 0 <= index < n:
                         fail()
+                # The per-step boundary seeds: None for the whole record
+                # (a migrated version-1 state, where every step follows the
+                # standard rules) or a per-step list whose entries are None
+                # or finite numbers. A seed may only sit at a recorded
+                # boundary; that is rechecked against prev_hiddens below.
+                seeds = record["segment_hiddens"]
+                if seeds is not None:
+                    if not isinstance(seeds, list) or len(seeds) != n:
+                        fail()
+                    for item in seeds:
+                        if item is None:
+                            continue
+                        need_number(item)
                 # Open-stream records alone remember the session's starting
                 # hidden state; read it only once the exact key set above has
                 # been confirmed.
@@ -479,10 +529,12 @@ class TanhSequence:
                 # same traversal. Every period the truncate rule cuts must be
                 # present in the boundary set (explicit starts may add more),
                 # and each prev_hiddens entry must be the value that step
-                # actually consumed: a stream's first step consumes its
-                # initial_hidden; a nonzero boundary consumes the previous
-                # segment's last output when carrying, else exactly zero;
-                # every other step continues from the previous output.
+                # actually consumed: an explicit boundary seed where one was
+                # recorded; a stream's first step otherwise consumes its
+                # initial_hidden; a nonzero boundary without a seed consumes
+                # the previous segment's last output when carrying, else
+                # exactly zero; every other step continues from the previous
+                # output.
                 boundaries = record["boundaries"]
                 if truncate is not None:
                     for index in range(n):
@@ -492,7 +544,13 @@ class TanhSequence:
                 prev_hiddens = record["prev_hiddens"]
                 carry = record["carry_hidden"]
                 for t in range(n):
-                    if t == 0:
+                    seed = seeds[t] if seeds is not None else None
+                    if seed is not None:
+                        # An explicit seed is only ever recorded at a segment
+                        # boundary and is exactly what the step consumed.
+                        if t not in boundaries or prev_hiddens[t] != seed:
+                            fail()
+                    elif t == 0:
                         # Only open-stream records remember the session's
                         # initial_hidden; a committed batch record has no
                         # stored starting value to compare step 0 against.
@@ -555,7 +613,15 @@ class TanhSequence:
         # later mutation (or another restore) can never reach the live state
         # through a shared reference, and repeatedly restoring one checkpoint
         # always yields the same trajectory. An open session in the current
-        # instance is simply overwritten.
+        # instance is simply overwritten. A record without seed information
+        # (migrated from a version-1 state) is normalized to an explicit
+        # all-None per-step list, the shape every live record carries.
+        def copy_seeds(record):
+            seeds = record["segment_hiddens"]
+            if seeds is None:
+                return [None] * len(record["outputs"])
+            return list(seeds)
+
         fwd_copy = None
         if checkpoint._fwd is not None:
             fwd_copy = {
@@ -566,6 +632,7 @@ class TanhSequence:
                 "truncate": checkpoint._fwd["truncate"],
                 "carry_hidden": checkpoint._fwd["carry_hidden"],
                 "weights": list(checkpoint._fwd["weights"]),
+                "segment_hiddens": copy_seeds(checkpoint._fwd),
             }
         stream_copy = None
         if checkpoint._stream is not None:
@@ -578,6 +645,7 @@ class TanhSequence:
                 "carry_hidden": checkpoint._stream["carry_hidden"],
                 "initial_hidden": checkpoint._stream["initial_hidden"],
                 "weights": list(checkpoint._stream["weights"]),
+                "segment_hiddens": copy_seeds(checkpoint._stream),
             }
 
         self.hidden = checkpoint._hidden
@@ -615,6 +683,7 @@ class TanhSequence:
                 "truncate": record["truncate"],
                 "carry_hidden": record["carry_hidden"],
                 "weights": list(record["weights"]),
+                "segment_hiddens": list(record["segment_hiddens"]),
             }
             if include_initial:
                 data["initial_hidden"] = record["initial_hidden"]
@@ -675,7 +744,7 @@ class TanhSequence:
         version = state["version"]
         if isinstance(version, bool) or not isinstance(version, int):
             fail()
-        if version != _STATE_VERSION:
+        if version not in _SUPPORTED_STATE_VERSIONS:
             raise ValueError("unsupported state version %r" % (version,))
         if state["kind"] != self._STATE_KIND:
             fail()
@@ -695,6 +764,9 @@ class TanhSequence:
                 fail()
             keys = {"inputs", "prev_hiddens", "outputs", "boundaries",
                     "truncate", "carry_hidden", "weights"}
+            if version >= 2:
+                # Version-2 records carry the per-step boundary seeds.
+                keys = keys | {"segment_hiddens"}
             if expect_initial:
                 keys = keys | {"initial_hidden"}
             if set(record.keys()) != keys:
@@ -710,6 +782,14 @@ class TanhSequence:
             # input object can reach the live state.
             parsed = dict(record)
             parsed["boundaries"] = set(boundaries)
+            if version >= 2:
+                if not isinstance(parsed["segment_hiddens"], list):
+                    fail()
+            else:
+                # Version 1 has no seed information: every step follows the
+                # standard boundary rules, represented as None and
+                # normalized to an explicit all-None list on commit.
+                parsed["segment_hiddens"] = None
             return parsed
 
         return _Checkpoint(
@@ -727,21 +807,30 @@ class TanhSequence:
             linear_last_weight=linear["last_weight"],
         )
 
-    def step(self, row, segment_start=False):
+    def step(self, row, segment_start=False, segment_hidden=None):
         # Validate before any state is touched, so a rejected row changes
         # neither hidden/outputs nor the Linear's last-forward record, and a
         # batch forward cache stays available for backward().
         if not isinstance(segment_start, bool):
             raise ValueError("segment_start must be a boolean")
+        # Optional detached hidden-state constant for this step, meaningful
+        # only at a segment boundary of an active stream session.
+        if segment_hidden is not None:
+            segment_hidden = _read_number(segment_hidden, "segment_hidden")
         values = _read_row(row, self.d)
         stream = self._stream
         if stream is not None:
-            return self._stream_step(stream, values, segment_start)
+            return self._stream_step(stream, values, segment_start,
+                                     segment_hidden)
         if segment_start:
             # Explicit boundary marks are only meaningful inside a session;
             # outside one there is no recorded trajectory to cut.
             raise RuntimeError(
                 "segment_start=True requires an active stream session; "
+                "call start_stream first")
+        if segment_hidden is not None:
+            raise RuntimeError(
+                "segment_hidden requires an active stream session; "
                 "call start_stream first")
         # Compute into a local first; only commit once the Linear forward and
         # the activation succeeded.
@@ -753,7 +842,7 @@ class TanhSequence:
         self._fwd = None
         return new_hidden
 
-    def _stream_step(self, stream, values, segment_start):
+    def _stream_step(self, stream, values, segment_start, segment_hidden=None):
         # One step inside an active stream session. The row and the boundary
         # flag are already validated; the step follows the same segment-
         # boundary rules as the batch traversal so the recorded trajectory
@@ -763,17 +852,27 @@ class TanhSequence:
         truncate = stream["truncate"]
         truncate_boundary = truncate is not None and i % truncate == 0
         is_boundary = truncate_boundary or segment_start
+        # An explicit seed may only be given where the step actually starts
+        # a segment; position 0 always counts as a boundary. Rejected before
+        # any state is touched.
+        if segment_hidden is not None and not is_boundary and i != 0:
+            raise ValueError(
+                "segment_hidden is only allowed at a segment boundary")
         # Select the hidden input this step consumes purely locally, without
         # touching the session: the boundary mark is committed only after the
-        # step has fully succeeded below. The first segment starts from the
-        # session's initial hidden state; without carry every later segment
-        # resets to zero; with carry it starts from a numeric copy of the
-        # previous segment's last hidden value. That copy is detached: it
-        # enters this step's local derivatives but no gradient crosses
-        # back over the boundary. Explicit segment_start marks merge with
-        # the truncate-produced boundaries.
-        if is_boundary:
-            if i == 0:
+        # step has fully succeeded below. An explicit seed takes precedence
+        # over every other rule and is detached: it enters this step's local
+        # derivatives but no gradient crosses back over the boundary.
+        # Otherwise the first segment starts from the session's initial
+        # hidden state; without carry every later segment resets to zero;
+        # with carry it starts from a numeric copy of the previous segment's
+        # last hidden value (also detached). Explicit segment_start marks
+        # merge with the truncate-produced boundaries.
+        if is_boundary or (i == 0 and segment_hidden is not None):
+            is_boundary = True
+            if segment_hidden is not None:
+                hidden = segment_hidden
+            elif i == 0:
                 hidden = stream["initial_hidden"]
             elif stream["carry_hidden"]:
                 hidden = float(stream["outputs"][-1])
@@ -818,6 +917,7 @@ class TanhSequence:
         stream["inputs"].append(values)
         stream["prev_hiddens"].append(hidden)
         stream["outputs"].append(new_hidden)
+        stream["segment_hiddens"].append(segment_hidden)
         return new_hidden
 
     def start_stream(self, initial_hidden=None, truncate=None, carry_hidden=False):
@@ -851,6 +951,9 @@ class TanhSequence:
             "truncate": truncate,
             "carry_hidden": carry_hidden,
             "initial_hidden": initial_hidden,
+            # Per-step boundary seeds (None wherever the standard rules
+            # supplied the hidden state).
+            "segment_hiddens": [],
             # Parameter state as of the session's forward traversal; a later
             # apply_gradients() must not affect backward() of this session.
             "weights": list(self.linear.weight),
@@ -872,13 +975,14 @@ class TanhSequence:
             "boundaries": stream["boundaries"],
             "truncate": stream["truncate"],
             "carry_hidden": stream["carry_hidden"],
+            "segment_hiddens": stream["segment_hiddens"],
             "weights": stream["weights"],
         }
         self._stream = None
         return list(stream["outputs"])
 
     def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None,
-                segment_starts=None):
+                segment_starts=None, segment_hiddens=None):
         if truncate is not None:
             if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
                 raise ValueError("truncate must be a positive integer or None")
@@ -912,6 +1016,31 @@ class TanhSequence:
                     % (len(segment_flags), n_rows))
         else:
             segment_flags = None
+        # Optional per-row boundary hidden-state seeds, read in input-row
+        # order. None keeps the existing behavior; otherwise one entry per
+        # row is required, each None or a finite non-bool number, and a
+        # number may only appear where the row actually starts a segment
+        # (position 0 always does). Type, length, domain and position are
+        # all validated before any state is touched.
+        if segment_hiddens is not None:
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_hiddens requires a sized rows sequence")
+            seeds = _read_segment_hiddens(segment_hiddens, n_rows,
+                                          "segment_hiddens")
+            for i, seed in enumerate(seeds):
+                if seed is None or i == 0:
+                    continue
+                declared = segment_flags is not None and segment_flags[i]
+                if not declared \
+                        and not (truncate is not None and i % truncate == 0):
+                    raise ValueError(
+                        "segment_hiddens may only give a value at a "
+                        "segment boundary")
+        else:
+            seeds = None
 
         # Validate every input row (type, width and finite domain) up front,
         # before any state, cache or Linear forward record is touched, so a
@@ -937,6 +1066,7 @@ class TanhSequence:
         prev_hiddens = []
         outputs = []
         boundaries = set()
+        seed_record = []
         # Parameter state of this forward pass. A later apply_gradients()
         # must not affect backward() of the recorded pass.
         weights = list(self.linear.weight)
@@ -948,18 +1078,23 @@ class TanhSequence:
         try:
             for i, x in enumerate(validated_rows):
                 declared = segment_flags is not None and segment_flags[i]
-                if (truncate is not None and i % truncate == 0) or declared:
-                    # Segment start. The very first segment starts from
-                    # initial_hidden; without carry every later segment is
-                    # reset to zero; with carry every later segment starts
-                    # from a numeric copy of the previous segment's last
-                    # hidden value. The value is detached from the autograd
-                    # graph: it enters the local derivatives of this
-                    # segment's first step but no gradient crosses back.
-                    # Explicit segment_starts declarations merge with the
-                    # truncate-produced boundaries; a mark at position 0 only
-                    # confirms the initial boundary.
-                    if i > 0 and carry_hidden:
+                seed = seeds[i] if seeds is not None else None
+                if (truncate is not None and i % truncate == 0) or declared \
+                        or (i == 0 and seed is not None):
+                    # Segment start. An explicit seed takes precedence over
+                    # every other rule; otherwise the very first segment
+                    # starts from initial_hidden, later segments reset to
+                    # zero without carry or start from a numeric copy of the
+                    # previous segment's last hidden value with carry. The
+                    # value is detached from the autograd graph: it enters
+                    # the local derivatives of this segment's first step but
+                    # no gradient crosses back. Explicit segment_starts
+                    # declarations merge with the truncate-produced
+                    # boundaries; a mark at position 0 only confirms the
+                    # initial boundary.
+                    if seed is not None:
+                        hidden = seed
+                    elif i > 0 and carry_hidden:
                         hidden = outputs[-1]
                     elif i > 0:
                         hidden = 0.0
@@ -974,6 +1109,7 @@ class TanhSequence:
                 hidden = self._activate(self.linear.forward(x + [hidden]))
                 inputs.append(x)
                 outputs.append(hidden)
+                seed_record.append(seed)
         except (TypeError, ValueError):
             self.hidden = saved_hidden
             self.outputs = saved_outputs
@@ -1008,6 +1144,7 @@ class TanhSequence:
             "boundaries": boundaries,
             "truncate": truncate,
             "carry_hidden": carry_hidden,
+            "segment_hiddens": seed_record,
             "weights": weights,
         }
         return list(outputs)
@@ -1438,7 +1575,7 @@ class GELUSequence(TanhSequence):
         self._stream["pres"] = []
         return None
 
-    def _stream_step(self, stream, values, segment_start):
+    def _stream_step(self, stream, values, segment_start, segment_hidden=None):
         # One step inside an active stream session, additionally recording
         # the step's pre-activation. Same boundary rules and the same
         # roll-back-on-failure atomicity as the base implementation.
@@ -1446,8 +1583,17 @@ class GELUSequence(TanhSequence):
         truncate = stream["truncate"]
         truncate_boundary = truncate is not None and i % truncate == 0
         is_boundary = truncate_boundary or segment_start
-        if is_boundary:
-            if i == 0:
+        # An explicit seed may only be given where the step actually starts
+        # a segment; position 0 always counts as a boundary. Rejected before
+        # any state is touched.
+        if segment_hidden is not None and not is_boundary and i != 0:
+            raise ValueError(
+                "segment_hidden is only allowed at a segment boundary")
+        if is_boundary or (i == 0 and segment_hidden is not None):
+            is_boundary = True
+            if segment_hidden is not None:
+                hidden = segment_hidden
+            elif i == 0:
                 hidden = stream["initial_hidden"]
             elif stream["carry_hidden"]:
                 hidden = float(stream["outputs"][-1])
@@ -1490,6 +1636,7 @@ class GELUSequence(TanhSequence):
         stream["prev_hiddens"].append(hidden)
         stream["outputs"].append(new_hidden)
         stream["pres"].append(z)
+        stream["segment_hiddens"].append(segment_hidden)
         return new_hidden
 
     def finish_stream(self):
@@ -1508,13 +1655,14 @@ class GELUSequence(TanhSequence):
             "boundaries": stream["boundaries"],
             "truncate": stream["truncate"],
             "carry_hidden": stream["carry_hidden"],
+            "segment_hiddens": stream["segment_hiddens"],
             "weights": stream["weights"],
         }
         self._stream = None
         return list(stream["outputs"])
 
     def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None,
-                segment_starts=None):
+                segment_starts=None, segment_hiddens=None):
         # Same validation, boundary and atomicity rules as the base batch
         # traversal; the recorded pass additionally stores each step's
         # pre-activation for the GELU backward pass.
@@ -1540,6 +1688,28 @@ class GELUSequence(TanhSequence):
                     % (len(segment_flags), n_rows))
         else:
             segment_flags = None
+        # Optional per-row boundary hidden-state seeds, with the base
+        # class's type, length, domain and position rules, all validated
+        # before any state is touched.
+        if segment_hiddens is not None:
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_hiddens requires a sized rows sequence")
+            seeds = _read_segment_hiddens(segment_hiddens, n_rows,
+                                          "segment_hiddens")
+            for i, seed in enumerate(seeds):
+                if seed is None or i == 0:
+                    continue
+                declared = segment_flags is not None and segment_flags[i]
+                if not declared \
+                        and not (truncate is not None and i % truncate == 0):
+                    raise ValueError(
+                        "segment_hiddens may only give a value at a "
+                        "segment boundary")
+        else:
+            seeds = None
 
         # Validate every input row up front, before any state, cache or
         # Linear forward record is touched.
@@ -1561,6 +1731,7 @@ class GELUSequence(TanhSequence):
         pres = []
         outputs = []
         boundaries = set()
+        seed_record = []
         # Parameter state of this forward pass. A later apply_gradients()
         # must not affect backward() of the recorded pass.
         weights = list(self.linear.weight)
@@ -1572,9 +1743,14 @@ class GELUSequence(TanhSequence):
         try:
             for i, x in enumerate(validated_rows):
                 declared = segment_flags is not None and segment_flags[i]
-                if (truncate is not None and i % truncate == 0) or declared:
-                    # Segment start, with the base class's carry/reset rules.
-                    if i > 0 and carry_hidden:
+                seed = seeds[i] if seeds is not None else None
+                if (truncate is not None and i % truncate == 0) or declared \
+                        or (i == 0 and seed is not None):
+                    # Segment start, with the base class's seed, carry and
+                    # reset rules (an explicit seed takes precedence).
+                    if seed is not None:
+                        hidden = seed
+                    elif i > 0 and carry_hidden:
                         hidden = outputs[-1]
                     elif i > 0:
                         hidden = 0.0
@@ -1591,6 +1767,7 @@ class GELUSequence(TanhSequence):
                 inputs.append(x)
                 pres.append(z)
                 outputs.append(hidden)
+                seed_record.append(seed)
         except (TypeError, ValueError):
             self.hidden = saved_hidden
             self.outputs = saved_outputs
@@ -1616,6 +1793,7 @@ class GELUSequence(TanhSequence):
             "boundaries": boundaries,
             "truncate": truncate,
             "carry_hidden": carry_hidden,
+            "segment_hiddens": seed_record,
             "weights": weights,
         }
         return list(outputs)
@@ -1759,6 +1937,7 @@ class GELUSequence(TanhSequence):
                 "truncate": fwd["truncate"],
                 "carry_hidden": fwd["carry_hidden"],
                 "weights": list(fwd["weights"]),
+                "segment_hiddens": list(fwd["segment_hiddens"]),
             }
             pres_fwd = list(fwd["pres"])
         stream = self._stream
@@ -1775,6 +1954,7 @@ class GELUSequence(TanhSequence):
                 "carry_hidden": stream["carry_hidden"],
                 "initial_hidden": stream["initial_hidden"],
                 "weights": list(stream["weights"]),
+                "segment_hiddens": list(stream["segment_hiddens"]),
             }
             pres_stream = list(stream["pres"])
         return _GELUCheckpoint(
@@ -1866,6 +2046,7 @@ class GELUSequence(TanhSequence):
                 "truncate": record["truncate"],
                 "carry_hidden": record["carry_hidden"],
                 "weights": list(record["weights"]),
+                "segment_hiddens": list(record["segment_hiddens"]),
             }
             if include_initial:
                 data["initial_hidden"] = record["initial_hidden"]
@@ -1911,7 +2092,7 @@ class GELUSequence(TanhSequence):
         version = state["version"]
         if isinstance(version, bool) or not isinstance(version, int):
             fail()
-        if version != _STATE_VERSION:
+        if version not in _SUPPORTED_STATE_VERSIONS:
             raise ValueError("unsupported state version %r" % (version,))
         if state["kind"] != self._STATE_KIND:
             fail()
@@ -1931,6 +2112,9 @@ class GELUSequence(TanhSequence):
                 fail()
             keys = {"inputs", "prev_hiddens", "outputs", "pre_activations",
                     "boundaries", "truncate", "carry_hidden", "weights"}
+            if version >= 2:
+                # Version-2 records carry the per-step boundary seeds.
+                keys = keys | {"segment_hiddens"}
             if expect_initial:
                 keys = keys | {"initial_hidden"}
             if set(record.keys()) != keys:
@@ -1947,6 +2131,14 @@ class GELUSequence(TanhSequence):
             parsed = dict(record)
             pres = parsed.pop("pre_activations")
             parsed["boundaries"] = set(boundaries)
+            if version >= 2:
+                if not isinstance(parsed["segment_hiddens"], list):
+                    fail()
+            else:
+                # Version 1 has no seed information: every step follows the
+                # standard boundary rules, represented as None and
+                # normalized to an explicit all-None list on commit.
+                parsed["segment_hiddens"] = None
             return parsed, pres
 
         fwd_record, pres_fwd = parse_trajectory(state["forward"], False)

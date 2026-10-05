@@ -521,7 +521,7 @@ class ExportImportTest(unittest.TestCase):
         seq.forward(ROWS, truncate=2)
         state = seq.export_state()
         self.assertEqual(state["kind"], "GELUSequenceState")
-        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["version"], 2)
         for cls in (TanhSequence, SigmoidSequence, SoftplusSequence,
                     ReLUSequence, LeakyReLUSequence):
             self.assertNotEqual(state["kind"],
@@ -599,7 +599,7 @@ class ExportImportTest(unittest.TestCase):
         dst.forward([[0.1], [0.2]])
         snap = dst.export_state()
         for tamper in (
-                lambda s: s.update(version=2),
+                lambda s: s.update(version=3),
                 lambda s: s.update(width=3),
                 lambda s: s.update(hidden=NAN),
                 lambda s: s["forward"].update(truncate=0),

@@ -44,7 +44,7 @@ class ExportShapeTest(unittest.TestCase):
         # JSON round trip preserves the value exactly: only dicts, lists,
         # finite numbers, booleans, strings and None are present.
         self.assertEqual(json_round_trip(state), state)
-        self.assertEqual(state["version"], 1)
+        self.assertEqual(state["version"], 2)
         self.assertIsInstance(state["version"], int)
         self.assertNotIsInstance(state["version"], bool)
         self.assertEqual(state["width"], 2)
@@ -220,10 +220,23 @@ class ImportValidationTest(unittest.TestCase):
         self.assert_import_rejected(state)
 
     def test_rejects_wrong_version(self):
-        for bad in (0, 2, -1, "1", 1.0, True, None):
+        for bad in (0, 3, -1, "1", 1.0, True, None):
             state = self.valid_state()
             state["version"] = bad
             self.assert_import_rejected(state)
+
+    def test_accepts_version_1_with_missing_seeds_as_none(self):
+        # A version-1 state has no "segment_hiddens" fields; it imports
+        # cleanly and every boundary value is interpreted as None.
+        state = json_round_trip(self.valid_state())
+        state["version"] = 1
+        del state["forward"]["segment_hiddens"]
+        dst = fresh_target()
+        dst.import_state(state)
+        # The instance re-exports in the current version with explicit
+        # all-None seeds, and continues exactly like the source.
+        self.assertEqual(dst.export_state(), self.src.export_state())
+        self.assertEqual(dst.backward(GO), self.src.backward(GO))
 
     def test_rejects_wrong_kind_and_width(self):
         state = self.valid_state()
