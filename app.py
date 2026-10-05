@@ -1309,6 +1309,56 @@ class LeakyReLUSequence(TanhSequence):
         return 1.0 if output > 0 else 0.01
 
 
+class ELUSequence(TanhSequence):
+    """ELU (exponential linear unit, fixed alpha = 1) counterpart of
+    TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is elu(z) with the fixed alpha 1 — exactly z for z > 0, the
+    exact zero constant 0.0 for z == 0, and expm1(z) = exp(z) - 1 for
+    z < 0 — and the local derivative carried through backward is 1.0
+    where z > 0 and exp(z) where z <= 0. The negative branch only ever
+    evaluates exp() at a strictly negative finite argument, so no finite
+    input can overflow it; a hugely negative z saturates to exactly -1.0.
+    alpha is not configurable: the constructor takes only the Linear,
+    exactly like the other sequence classes. Exported states carry a
+    distinct kind tag ("ELUSequenceState"), so a state of any other
+    sequence class never migrates into an ELUSequence (or vice versa);
+    the version rule is unchanged.
+    """
+
+    _STATE_KIND = "ELUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # The pre-activation is already validated finite by Linear.forward.
+        # For z < 0 the exponential's argument is strictly negative, so it
+        # can at worst underflow to zero: expm1(z) stays finite and tends
+        # to exactly -1.0 for a hugely negative z, with no overflow path.
+        # z == 0 (including -0.0) returns the exact positive zero constant
+        # rather than z itself.
+        if z > 0:
+            return z
+        if z == 0:
+            return 0.0
+        return math.expm1(z)
+
+    @staticmethod
+    def _activation_derivative(output):
+        # The cached output equals z wherever z > 0, is exactly 0.0 at
+        # z == 0 and equals expm1(z) (in [-1, 0)) wherever z < 0, so it
+        # alone decides the branch: derivative 1 at a positive pre-
+        # activation, and exp(z) = 1 + expm1(z) = 1 + output at z <= 0.
+        # At z == 0 this is exactly 1.0 + 0.0 = 1.0, and in the saturated
+        # limit output == -1.0 it is exactly 0.0.
+        return 1.0 if output > 0 else 1.0 + output
+
+
 # Constants of the exact (error-function) GELU formulation, computed once.
 _GELU_SQRT2 = math.sqrt(2.0)
 _GELU_SQRT_2PI = math.sqrt(2.0 * math.pi)
