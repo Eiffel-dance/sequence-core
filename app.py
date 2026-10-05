@@ -2159,3 +2159,672 @@ class GELUSequence(TanhSequence):
             pres_fwd=pres_fwd,
             pres_stream=pres_stream,
         )
+
+
+def _silu_sigmoid(z):
+    # Numerically stable logistic sigmoid shared by the SiLU activation and its
+    # derivative. For negative z the equivalent form exp(z) / (1 + exp(z))
+    # keeps the exponential's argument negative, so no finite pre-activation can
+    # overflow it; both branches yield a finite value in (0, 1).
+    if z >= 0:
+        return 1.0 / (1.0 + math.exp(-z))
+    ez = math.exp(z)
+    return ez / (1.0 + ez)
+
+
+class _SiLUCheckpoint(_Checkpoint):
+    # SiLUSequence checkpoint: the standard trajectory records plus the
+    # per-step pre-activations the SiLU backward pass differentiates through
+    # (like GELU, the derivative cannot be recovered from the output). The
+    # pre-activations travel in dedicated slots, so the records themselves keep
+    # the shared shape that the base restore() already knows how to validate.
+    __slots__ = ("_pres_fwd", "_pres_stream")
+
+    def __init__(self, *args, pres_fwd=None, pres_stream=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pres_fwd = pres_fwd
+        self._pres_stream = pres_stream
+
+
+class SiLUSequence(TanhSequence):
+    """SiLU (sigmoid linear unit, a.k.a. swish-1) counterpart of
+    TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is silu(z) = z * sigma(z) with sigma(z) = 1 / (1 +
+    exp(-z)) — evaluated as exp(z) / (1 + exp(z)) for z < 0 so no
+    finite pre-activation can overflow the exponential — and the local
+    derivative carried through backward is sigma(z) * (1 + z *
+    (1 - sigma(z))). Because that derivative cannot be recovered reliably
+    from the cached output, each trajectory record additionally stores the
+    per-step pre-activations ("pres"); they travel inside checkpoints and
+    exported states (as "pre_activations") under the same validation,
+    copying and atomicity rules as every other recorded datum. There are no
+    configurable parameters: the constructor takes only the Linear, exactly
+    like the other sequence classes. Exported states carry a distinct kind
+    tag ("SiLUSequenceState"), so a state of any other sequence class
+    never migrates into a SiLUSequence (or vice versa); the version rule is
+    unchanged.
+    """
+
+    _STATE_KIND = "SiLUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # z * sigma(z) with the numerically stable sigmoid. The pre-activation
+        # is already validated finite by Linear.forward; sigma stays in (0, 1)
+        # and its exponential's argument is never positive, so the product is
+        # finite for every finite z (a huge positive z saturates sigma to exactly
+        # 1 and yields z, a huge negative z drives sigma to exactly 0.0).
+        return z * _silu_sigmoid(z)
+
+    @staticmethod
+    def _activation_derivative(z):
+        # Local derivative of z * sigma(z):
+        #   sigma(z) + z * sigma(z) * (1 - sigma(z))
+        #   = sigma(z) * (1 + z * (1 - sigma(z))).
+        # Converting to float first keeps huge finite ints out of int/float
+        # mixed arithmetic; the stable sigmoid keeps every finite z finite: for
+        # z -> +inf sigma is exactly 1 and (1 - sigma) underflows to 0 so
+        # the derivative tends to exactly 1.0, and for z -> -inf sigma
+        # underflows to 0.0 so it tends to exactly 0.0.
+        z = float(z)
+        s = _silu_sigmoid(z)
+        return s * (1.0 + z * (1.0 - s))
+
+    def start_stream(self, initial_hidden=None, truncate=None, carry_hidden=False):
+        # Same validation and session setup as the base class; the session
+        # record additionally tracks the per-step pre-activations.
+        super().start_stream(initial_hidden=initial_hidden,
+                           truncate=truncate, carry_hidden=carry_hidden)
+        self._stream["pres"] = []
+        return None
+
+    def _stream_step(self, stream, values, segment_start, segment_hidden=None):
+        # One step inside an active stream session, additionally recording
+        # the step's pre-activation. Same boundary rules and the same
+        # roll-back-on-failure atomicity as the base implementation.
+        i = len(stream["inputs"])
+        truncate = stream["truncate"]
+        truncate_boundary = truncate is not None and i % truncate == 0
+        is_boundary = truncate_boundary or segment_start
+        # An explicit seed may only be given where the step actually starts
+        # a segment; position 0 always counts as a boundary. Rejected before
+        # any state is touched.
+        if segment_hidden is not None and not is_boundary and i != 0:
+            raise ValueError(
+                "segment_hidden is only allowed at a segment boundary")
+        if is_boundary or (i == 0 and segment_hidden is not None):
+            is_boundary = True
+            if segment_hidden is not None:
+                hidden = segment_hidden
+            elif i == 0:
+                hidden = stream["initial_hidden"]
+            elif stream["carry_hidden"]:
+                hidden = float(stream["outputs"][-1])
+            else:
+                hidden = 0.0
+        else:
+            hidden = self.hidden
+
+        # Snapshot every observable datum the computation may touch, exactly
+        # as the base step does, so a rejected step rolls the session back
+        # to its pre-call state.
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+        saved_boundaries = set(stream["boundaries"])
+        try:
+            z = self.linear.forward(values + [hidden])
+            new_hidden = self._activate(z)
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            stream["boundaries"] = saved_boundaries
+            raise
+
+        # The whole step computed successfully: only now commit the boundary
+        # mark, the advanced hidden/output state and this step's trajectory
+        # entry (pre-activation included).
+        if is_boundary:
+            stream["boundaries"].add(i)
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
+        stream["inputs"].append(values)
+        stream["prev_hiddens"].append(hidden)
+        stream["outputs"].append(new_hidden)
+        stream["pres"].append(z)
+        stream["segment_hiddens"].append(segment_hidden)
+        return new_hidden
+
+    def finish_stream(self):
+        stream = self._stream
+        if stream is None:
+            raise RuntimeError(
+                "finish_stream requires an active session; call start_stream first")
+        # Commit the recorded trajectory as the cached forward pass, in the
+        # same shape the batch traversal produces (pre-activations
+        # included), so the backward entries reuse the shared formulas.
+        self._fwd = {
+            "inputs": stream["inputs"],
+            "prev_hiddens": stream["prev_hiddens"],
+            "outputs": stream["outputs"],
+            "pres": stream["pres"],
+            "boundaries": stream["boundaries"],
+            "truncate": stream["truncate"],
+            "carry_hidden": stream["carry_hidden"],
+            "segment_hiddens": stream["segment_hiddens"],
+            "weights": stream["weights"],
+        }
+        self._stream = None
+        return list(stream["outputs"])
+
+    def forward(self, rows, truncate=None, carry_hidden=False, initial_hidden=None,
+                segment_starts=None, segment_hiddens=None):
+        # Same validation, boundary and atomicity rules as the base batch
+        # traversal; the recorded pass additionally stores each step's
+        # pre-activation for the SiLU backward pass.
+        if truncate is not None:
+            if isinstance(truncate, bool) or not isinstance(truncate, int) or truncate <= 0:
+                raise ValueError("truncate must be a positive integer or None")
+        if not isinstance(carry_hidden, bool):
+            raise ValueError("carry_hidden must be a boolean")
+        if initial_hidden is None:
+            initial_hidden = 0.0
+        else:
+            initial_hidden = _read_number(initial_hidden, "initial_hidden")
+        if segment_starts is not None:
+            segment_flags = _read_bool_sequence(segment_starts, "segment_starts")
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_starts requires a sized rows sequence")
+            if len(segment_flags) != n_rows:
+                raise ValueError(
+                    "segment_starts length %d does not match rows length %d"
+                    % (len(segment_flags), n_rows))
+        else:
+            segment_flags = None
+        # Optional per-row boundary hidden-state seeds, with the base
+        # class's type, length, domain and position rules, all validated
+        # before any state is touched.
+        if segment_hiddens is not None:
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_hiddens requires a sized rows sequence")
+            seeds = _read_segment_hiddens(segment_hiddens, n_rows,
+                                          "segment_hiddens")
+            for i, seed in enumerate(seeds):
+                if seed is None or i == 0:
+                    continue
+                declared = segment_flags is not None and segment_flags[i]
+                if not declared \
+                        and not (truncate is not None and i % truncate == 0):
+                    raise ValueError(
+                        "segment_hiddens may only give a value at a "
+                        "segment boundary")
+        else:
+            seeds = None
+
+        # Validate every input row up front, before any state, cache or
+        # Linear forward record is touched.
+        validated_rows = [_read_row(row, self.d) for row in rows]
+
+        # Snapshot every piece of observable state the traversal may touch,
+        # so any failure rolls the sequence back to its pre-call state.
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_fwd = self._fwd
+        saved_stream = self._stream
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+
+        inputs = []
+        prev_hiddens = []
+        pres = []
+        outputs = []
+        boundaries = set()
+        seed_record = []
+        # Parameter state of this forward pass. A later apply_gradients()
+        # must not affect backward() of the recorded pass.
+        weights = list(self.linear.weight)
+
+        # The traversal works on locals only; self.* is committed solely on
+        # full success below. An empty rows sequence therefore commits
+        # initial_hidden as the current hidden state with empty outputs.
+        hidden = initial_hidden
+        try:
+            for i, x in enumerate(validated_rows):
+                declared = segment_flags is not None and segment_flags[i]
+                seed = seeds[i] if seeds is not None else None
+                if (truncate is not None and i % truncate == 0) or declared \
+                        or (i == 0 and seed is not None):
+                    # Segment start, with the base class's seed, carry and
+                    # reset rules (an explicit seed takes precedence).
+                    if seed is not None:
+                        hidden = seed
+                    elif i > 0 and carry_hidden:
+                        hidden = outputs[-1]
+                    elif i > 0:
+                        hidden = 0.0
+                    else:
+                        hidden = initial_hidden
+                    boundaries.add(i)
+                prev_hiddens.append(hidden)
+                # Linear.forward rejects a non-finite pre-activation before
+                # caching anything, and the SiLU activation of a finite
+                # value is always finite, so every committed hidden/output
+                # value is finite.
+                z = self.linear.forward(x + [hidden])
+                hidden = self._activate(z)
+                inputs.append(x)
+                pres.append(z)
+                outputs.append(hidden)
+                seed_record.append(seed)
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self._fwd = saved_fwd
+            self._stream = saved_stream
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            raise
+
+        self.hidden = hidden
+        # Each consumer gets its own list, exactly as in the base class.
+        self.outputs = list(outputs)
+        # A successful batch traversal supersedes any half-finished stream
+        # session; a failed one restored it above.
+        self._stream = None
+        self._fwd = {
+            "inputs": inputs,
+            "prev_hiddens": prev_hiddens,
+            "outputs": list(outputs),
+            "pres": pres,
+            "boundaries": boundaries,
+            "truncate": truncate,
+            "carry_hidden": carry_hidden,
+            "segment_hiddens": seed_record,
+            "weights": weights,
+        }
+        return list(outputs)
+
+    def _backward(self, grad_outputs, grad_hidden, return_initial,
+                  return_boundaries=False):
+        # Same recurrence, accumulation and atomicity rules as the base
+        # backward pass; the local derivative is taken at the recorded
+        # pre-activation of each step.
+        if self._stream is not None:
+            raise RuntimeError(
+                "backward requires the stream session to be finished first")
+        if self._fwd is None:
+            raise RuntimeError("backward requires a cached forward pass; call forward first")
+
+        inputs = self._fwd["inputs"]
+        prev_hiddens = self._fwd["prev_hiddens"]
+        outputs = self._fwd["outputs"]
+        pres = self._fwd["pres"]
+        boundaries = self._fwd["boundaries"]
+        # Forward-time parameter snapshot: the first d weights pair with the
+        # d input features of each recorded row, the last with the previous
+        # hidden state.
+        weights = self._fwd["weights"]
+        d = len(weights) - 1
+        w_inputs = weights[:d]
+        w_hidden = weights[d]
+        n = len(outputs)
+        # Validate every argument before any gradient is accumulated, so a
+        # rejected call leaves both the cache and the Linear's accumulated
+        # gradients exactly as they were.
+        grad_outputs = _read_grad_list(grad_outputs, n)
+        grad_hidden = _read_number(grad_hidden, "grad_hidden")
+
+        # Accumulate this pass entirely into locals and commit to the Linear
+        # only once every produced value is finite, so an overflowing pass
+        # never leaves partially accumulated parameter gradients.
+        param_grad = list(self.linear.grad)
+        param_grad_bias = self.linear.grad_bias
+
+        input_grads = [0.0] * n
+        # Hidden-state gradients recorded at segment starts past index 0, in
+        # traversal (descending) order; reversed into ascending order below.
+        boundary_grads = []
+
+        # The terminal hidden-state gradient seeds the recurrence at the last
+        # step, where it is added to that step's output gradient. A zero seed
+        # reproduces backward() bit for bit.
+        hidden_grad = float(grad_hidden)
+        # An empty cached sequence has no steps: return the terminal gradient
+        # unchanged (as provided) without touching any parameter gradient.
+        grad_initial_hidden = grad_hidden if n == 0 else 0.0
+        try:
+            for t in range(n - 1, -1, -1):
+                # Gradient from later steps *within this segment* (including the
+                # terminal hidden-state gradient at the final step) still flows
+                # into the current step together with its own output gradient.
+                dh = grad_outputs[t] + hidden_grad
+                d_pre = dh * self._activation_derivative(pres[t])
+
+                # Parameter gradients at this step are always accumulated,
+                # including at segment starts (the detached carry value is
+                # treated as a constant and enters this local derivative only).
+                row = inputs[t]
+                for k in range(d):
+                    param_grad[k] += d_pre * row[k]
+                param_grad[d] += d_pre * prev_hiddens[t]
+                param_grad_bias += d_pre
+
+                # Input gradients mirror the input shape: one row of d gradients
+                # per step for a multi-feature sequence, and the original flat
+                # scalar list when d == 1.
+                row_grads = [d_pre * w for w in w_inputs]
+                input_grads[t] = row_grads[0] if d == 1 else row_grads
+                # Step 0 always consumes initial_hidden as its previous hidden
+                # state. With truncation the boundary cut below severs later
+                # segments, so this local term is the full gradient with respect
+                # to initial_hidden; without truncation it is reached uncut.
+                if t == 0:
+                    grad_initial_hidden = d_pre * w_hidden
+                if t in boundaries:
+                    # Truncated BPTT: segment-start hidden values (zeroed or
+                    # carried as detached numbers) are constants, so no gradient
+                    # crosses back into the prior segment. For a start past
+                    # index 0, d_pre * w_hidden is the total gradient the
+                    # merged within-segment recurrence delivers to that detached
+                    # boundary constant; record it before severing the link.
+                    if return_boundaries and t > 0:
+                        boundary_grads.append((t, d_pre * w_hidden))
+                    hidden_grad = 0.0
+                else:
+                    hidden_grad = d_pre * w_hidden
+        except OverflowError:
+            raise ValueError("backward result must be finite")
+
+        # Verify the whole pass produced finite numbers before committing any
+        # of it: non-finite parameter gradients, input gradients, seeds or
+        # boundary gradients are all rejected with state untouched.
+        def _check(value):
+            _require_finite(value, "gradient")
+
+        for value in param_grad:
+            _check(value)
+        _check(param_grad_bias)
+        _check(grad_initial_hidden)
+        for value in input_grads:
+            if isinstance(value, list):
+                for item in value:
+                    _check(item)
+            else:
+                _check(value)
+        for _, value in boundary_grads:
+            _check(value)
+
+        self.linear.grad = param_grad
+        self.linear.grad_bias = param_grad_bias
+
+        if return_boundaries:
+            boundary_grads.reverse()
+            return input_grads, grad_initial_hidden, boundary_grads
+        if return_initial:
+            return input_grads, grad_initial_hidden
+        return input_grads
+
+    def checkpoint(self):
+        # Same capture rules as the base class: a non-mutating snapshot of
+        # the full state, owned by this instance, with every mutable datum
+        # deep-copied. The per-step pre-activations travel in the dedicated
+        # _SiLUCheckpoint slots, keeping the trajectory records themselves in the
+        # shared standard shape.
+        fwd = self._fwd
+        if fwd is None:
+            fwd_copy = None
+            pres_fwd = None
+        else:
+            fwd_copy = {
+                "inputs": [list(row) for row in fwd["inputs"]],
+                "prev_hiddens": list(fwd["prev_hiddens"]),
+                "outputs": list(fwd["outputs"]),
+                "boundaries": set(fwd["boundaries"]),
+                "truncate": fwd["truncate"],
+                "carry_hidden": fwd["carry_hidden"],
+                "weights": list(fwd["weights"]),
+                "segment_hiddens": list(fwd["segment_hiddens"]),
+            }
+            pres_fwd = list(fwd["pres"])
+        stream = self._stream
+        if stream is None:
+            stream_copy = None
+            pres_stream = None
+        else:
+            stream_copy = {
+                "inputs": [list(row) for row in stream["inputs"]],
+                "prev_hiddens": list(stream["prev_hiddens"]),
+                "outputs": list(stream["outputs"]),
+                "boundaries": set(stream["boundaries"]),
+                "truncate": stream["truncate"],
+                "carry_hidden": stream["carry_hidden"],
+                "initial_hidden": stream["initial_hidden"],
+                "weights": list(stream["weights"]),
+                "segment_hiddens": list(stream["segment_hiddens"]),
+            }
+            pres_stream = list(stream["pres"])
+        return _SiLUCheckpoint(
+            owner_ref=weakref.ref(self),
+            width=self.d + 1,
+            hidden=self.hidden,
+            outputs=list(self.outputs),
+            fwd=fwd_copy,
+            stream=stream_copy,
+            linear_weight=list(self.linear.weight),
+            linear_bias=self.linear.bias,
+            linear_grad=list(self.linear.grad),
+            linear_grad_bias=self.linear.grad_bias,
+            linear_last=None if self.linear.last is None
+            else list(self.linear.last),
+            linear_last_weight=None if self.linear._last_weight is None
+            else list(self.linear._last_weight),
+            pres_fwd=pres_fwd,
+            pres_stream=pres_stream,
+        )
+
+    def restore(self, checkpoint):
+        # Validate the pre-activation slots first, then delegate to the base
+        # validation/commit, then attach the pre-activations to the freshly
+        # committed records. A rejected checkpoint (wrong type, corrupted,
+        # foreign-owned, width-incompatible or non-finite) raises ValueError
+        # before anything is touched, so the instance is left exactly as it was.
+        if not isinstance(checkpoint, _SiLUCheckpoint):
+            raise ValueError("restore requires a checkpoint returned by checkpoint()")
+
+        def fail():
+            raise ValueError("checkpoint is corrupted")
+
+        def validate_pres(record, pres):
+            # Structural and finite-domain validation of the pre-activation
+            # list paired with one trajectory record, mirroring the base
+            # class's numeric rules.
+            if record is None:
+                if pres is not None:
+                    fail()
+                return
+            if not isinstance(pres, list):
+                fail()
+            if len(pres) != len(record["outputs"]):
+                fail()
+            for value in pres:
+                if isinstance(value, bool) or not isinstance(value, (int, float)):
+                    fail()
+                if not _is_finite(value):
+                    raise ValueError(
+                        "checkpoint contains a non-finite numeric value")
+
+        try:
+            validate_pres(checkpoint._fwd, checkpoint._pres_fwd)
+            validate_pres(checkpoint._stream, checkpoint._pres_stream)
+        except ValueError:
+            raise
+        except (AttributeError, TypeError, KeyError):
+            raise ValueError("checkpoint is corrupted")
+
+        # The base restore re-validates every other rule (ownership, width,
+        # finite numeric domain, trajectory/boundary consistency, the
+        # truncation hidden-state rules, batch-cache/stream exclusivity,
+        # Linear cache shapes) and commits copies atomically.
+        super().restore(checkpoint)
+        # Attach the pre-activation records to the freshly committed
+        # trajectory dicts. These list copies cannot fail, so the commit
+        # stays atomic.
+        if checkpoint._fwd is not None:
+            self._fwd["pres"] = list(checkpoint._pres_fwd)
+        if checkpoint._stream is not None:
+            self._stream["pres"] = list(checkpoint._pres_stream)
+        return None
+
+    def export_state(self):
+        # Portable counterpart of checkpoint(): the same state as an
+        # independent plain-data object that round-trips through JSON. The
+        # per-step pre-activations travel as "pre_activations" lists inside
+        # the forward/stream records; every other field follows the shared
+        # format and rules.
+        def dump_trajectory(record, include_initial):
+            data = {
+                "inputs": [list(row) for row in record["inputs"]],
+                "prev_hiddens": list(record["prev_hiddens"]),
+                "outputs": list(record["outputs"]),
+                "pre_activations": list(record["pres"]),
+                "boundaries": sorted(record["boundaries"]),
+                "truncate": record["truncate"],
+                "carry_hidden": record["carry_hidden"],
+                "weights": list(record["weights"]),
+                "segment_hiddens": list(record["segment_hiddens"]),
+            }
+            if include_initial:
+                data["initial_hidden"] = record["initial_hidden"]
+            return data
+
+        fwd = self._fwd
+        stream = self._stream
+        return {
+            "version": _STATE_VERSION,
+            "kind": self._STATE_KIND,
+            "width": self.d + 1,
+            "hidden": self.hidden,
+            "outputs": list(self.outputs),
+            "forward": None if fwd is None else dump_trajectory(fwd, False),
+            "stream": None if stream is None else dump_trajectory(stream, True),
+            "linear": {
+                "weight": list(self.linear.weight),
+                "bias": self.linear.bias,
+                "grad": list(self.linear.grad),
+                "grad_bias": self.linear.grad_bias,
+                "last": None if self.linear.last is None
+                else list(self.linear.last),
+                "last_weight": None if self.linear._last_weight is None
+                else list(self.linear._last_weight),
+            },
+        }
+
+    def _parse_exported_state(self, state):
+        # Structural validation of a plain-data SiLUSequence state object
+        # and conversion into a _SiLUCheckpoint owned by this instance. Same
+        # rules as the base parser, plus the "pre_activations" field of each
+        # trajectory record, which is moved into the checkpoint's dedicated
+        # slots and semantically validated by restore().
+        def fail():
+            raise ValueError("state has an invalid structure")
+
+        if not isinstance(state, dict):
+            raise ValueError(
+                "import_state requires a state produced by export_state()")
+        if set(state.keys()) != {"version", "kind", "width", "hidden",
+                                 "outputs", "forward", "stream", "linear"}:
+            fail()
+        version = state["version"]
+        if isinstance(version, bool) or not isinstance(version, int):
+            fail()
+        if version not in _SUPPORTED_STATE_VERSIONS:
+            raise ValueError("unsupported state version %r" % (version,))
+        if state["kind"] != self._STATE_KIND:
+            fail()
+        width = state["width"]
+        if isinstance(width, bool) or not isinstance(width, int) or width < 2:
+            fail()
+        linear = state["linear"]
+        if not isinstance(linear, dict) \
+                or set(linear.keys()) != {"weight", "bias", "grad",
+                                          "grad_bias", "last", "last_weight"}:
+            fail()
+
+        def parse_trajectory(record, expect_initial):
+            if record is None:
+                return None, None
+            if not isinstance(record, dict):
+                fail()
+            keys = {"inputs", "prev_hiddens", "outputs", "pre_activations",
+                    "boundaries", "truncate", "carry_hidden", "weights"}
+            if version >= 2:
+                # Version-2 records carry the per-step boundary seeds.
+                keys = keys | {"segment_hiddens"}
+            if expect_initial:
+                keys = keys | {"initial_hidden"}
+            if set(record.keys()) != keys:
+                fail()
+            boundaries = record["boundaries"]
+            if not isinstance(boundaries, list):
+                fail()
+            for index in boundaries:
+                if isinstance(index, bool) or not isinstance(index, int):
+                    fail()
+            # Shallow copy so the caller's dict is never mutated; restore()
+            # deep-copies everything it commits, so no reference to the
+            # input object can reach the live state.
+            parsed = dict(record)
+            pres = parsed.pop("pre_activations")
+            parsed["boundaries"] = set(boundaries)
+            if version >= 2:
+                if not isinstance(parsed["segment_hiddens"], list):
+                    fail()
+            else:
+                # Version 1 has no seed information: every step follows the
+                # standard boundary rules, represented as None and
+                # normalized to an explicit all-None list on commit.
+                parsed["segment_hiddens"] = None
+            return parsed, pres
+
+        fwd_record, pres_fwd = parse_trajectory(state["forward"], False)
+        stream_record, pres_stream = parse_trajectory(state["stream"], True)
+        return _SiLUCheckpoint(
+            owner_ref=weakref.ref(self),
+            width=width,
+            hidden=state["hidden"],
+            outputs=state["outputs"],
+            fwd=fwd_record,
+            stream=stream_record,
+            linear_weight=linear["weight"],
+            linear_bias=linear["bias"],
+            linear_grad=linear["grad"],
+            linear_grad_bias=linear["grad_bias"],
+            linear_last=linear["last"],
+            linear_last_weight=linear["last_weight"],
+            pres_fwd=pres_fwd,
+            pres_stream=pres_stream,
+        )
