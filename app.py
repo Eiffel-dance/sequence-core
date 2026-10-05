@@ -1307,3 +1307,553 @@ class LeakyReLUSequence(TanhSequence):
         # it alone decides the branch: derivative 1 at positive output, the
         # fixed slope 0.01 at zero or negative output.
         return 1.0 if output > 0 else 0.01
+
+
+# One over sqrt(2*pi), the coefficient of the Gaussian-pdf term in the GELU
+# local derivative.
+_GELU_PDF_COEF = 1.0 / math.sqrt(2.0 * math.pi)
+
+
+class _GELUCheckpoint(_Checkpoint):
+    # GELU checkpoint: the same snapshot as _Checkpoint plus the recorded
+    # finite pre-activations z of the committed batch pass / open stream
+    # session. GELU's local derivative is a function of z (GELU is not
+    # monotone, so z cannot be recovered from the cached output); the lists
+    # align index for index with the trajectory outputs.
+    __slots__ = ("_fwd_pres", "_stream_pres")
+
+    def __init__(self, owner_ref, width, hidden, outputs, fwd, stream,
+                 linear_weight, linear_bias, linear_grad, linear_grad_bias,
+                 linear_last, linear_last_weight,
+                 fwd_pres=None, stream_pres=None):
+        super().__init__(
+            owner_ref, width, hidden, outputs, fwd, stream,
+            linear_weight, linear_bias, linear_grad, linear_grad_bias,
+            linear_last, linear_last_weight)
+        self._fwd_pres = fwd_pres
+        self._stream_pres = stream_pres
+
+
+class GELUSequence(TanhSequence):
+    """Gaussian-error-linear-unit (GELU) counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/
+    restore and export_state/import_state interface. The pre-activation z
+    is the input weighted sum plus the recurrent hidden term plus the bias;
+    the output is gelu(z) = 0.5 * z * (1 + erf(z / sqrt(2))) — exactly 0.0
+    at z == 0, finite for every finite z, with no overflow path in either
+    the exponential or the multiplication — and the local derivative
+    carried through backward is
+
+        0.5 * (1 + erf(z / sqrt(2))) + z * exp(-z * z / 2) / sqrt(2*pi).
+
+    Unlike the other units the derivative is expressed in the pre-activation
+    z rather than the cached output (GELU is non-monotone: one negative
+    output corresponds to two different z values), so each recorded
+    trajectory additionally caches its finite z values. Exported states
+    carry a distinct kind tag ("GELUSequenceState"), so a state of any
+    other sequence class never migrates into a GELUSequence (or vice
+    versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "GELUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # gelu(z) = 0.5 * z * (1 + erf(z / sqrt(2))). math.erf is finite and
+        # saturates to +/-1 for every finite double, so for a huge |z| the
+        # expression reduces to exactly 0.5*z*(1 +/- 1): 1 + erf(-huge)
+        # rounds to a true zero (erf underflows to -1.0, its tail below the
+        # machine epsilon) and 0.5 * z * 0.0 is an exact finite zero rather
+        # than an infinity, so no finite z can overflow the product. Near
+        # z == 0 a direct multiply would lose the ~z^3 correction inside
+        # 1 + erf(...); math.erfc(-z/sqrt(2)) computes 1 + erf(...) without
+        # that cancellation, keeping the formula's accuracy there. z == 0
+        # (including -0.0) returns the exact positive zero constant.
+        if z == 0.0:
+            return 0.0
+        if -1.0 < z < 1.0:
+            return 0.5 * z * math.erfc(-z * (0.5 * math.sqrt(2.0)))
+        return 0.5 * z * (1.0 + math.erf(z * (0.5 * math.sqrt(2.0))))
+
+    @staticmethod
+    def _activation_derivative(z):
+        # Phi-like local derivative:
+        # 0.5 * (1 + erf(z/sqrt(2))) + z * exp(-z*z/2) / sqrt(2*pi).
+        # For a huge negative z both terms must vanish; 1 + erf(z/sqrt(2))
+        # rounds to a true zero (erf is saturated at -1.0) and exp(-z*z/2)
+        # underflows to 0.0, so z * 0.0 stays a finite zero. A huge positive
+        # z yields CDF exactly 1.0 and the same underflowed pdf product.
+        # exp(-z*z/2) is computed as exp(-0.5*z*z) with the argument
+        # non-positive (it underflows, never overflows). Around zero the
+        # CDF term again goes through erfc for accuracy.
+        x = z * (0.5 * math.sqrt(2.0))
+        if -1.0 < z < 1.0:
+            cdf = 0.5 * math.erfc(-x)
+        else:
+            cdf = 0.5 * (1.0 + math.erf(x))
+        return cdf + z * math.exp(-0.5 * z * z) * _GELU_PDF_COEF
+
+    def __init__(self, linear):
+        super().__init__(linear)
+        # Recorded finite pre-activations, aligned index for index with the
+        # base class's cached/stream trajectories; None whenever no pass is
+        # recorded. Kept in this subclass only, so the other sequence units
+        # and their caches are untouched.
+        self._fwd_pre = None
+        self._stream_pre = None
+
+    def reset(self):
+        # Reset like the base class and drop the recorded pre-activations
+        # too; the wrapped Linear is left untouched by the base call.
+        super().reset()
+        self._fwd_pre = None
+        self._stream_pre = None
+
+    def _make_checkpoint(self, fwd_pres, stream_pres):
+        # Build a GELU-owned checkpoint carrying the base snapshot plus the
+        # recorded pre-activations. Every mutable datum is copied by the
+        # caller's record dicts / here.
+        return _GELUCheckpoint(
+            owner_ref=weakref.ref(self),
+            width=self.d + 1,
+            hidden=self.hidden,
+            outputs=list(self.outputs),
+            fwd=self._snapshot_trajectory(self._fwd),
+            stream=self._snapshot_trajectory(self._stream,
+                                             include_initial=True),
+            linear_weight=list(self.linear.weight),
+            linear_bias=self.linear.bias,
+            linear_grad=list(self.linear.grad),
+            linear_grad_bias=self.linear.grad_bias,
+            linear_last=None if self.linear.last is None
+            else list(self.linear.last),
+            linear_last_weight=None if self.linear._last_weight is None
+            else list(self.linear._last_weight),
+            fwd_pres=None if fwd_pres is None else list(fwd_pres),
+            stream_pres=None if stream_pres is None else list(stream_pres),
+        )
+
+    @staticmethod
+    def _snapshot_trajectory(record, include_initial=False):
+        if record is None:
+            return None
+        data = {
+            "inputs": [list(row) for row in record["inputs"]],
+            "prev_hiddens": list(record["prev_hiddens"]),
+            "outputs": list(record["outputs"]),
+            "boundaries": set(record["boundaries"]),
+            "truncate": record["truncate"],
+            "carry_hidden": record["carry_hidden"],
+            "weights": list(record["weights"]),
+        }
+        if include_initial:
+            data["initial_hidden"] = record["initial_hidden"]
+        return data
+
+    def checkpoint(self):
+        return self._make_checkpoint(self._fwd_pre, self._stream_pre)
+
+    def restore(self, checkpoint):
+        # A GELU checkpoint is the only accepted kind; a base _Checkpoint
+        # (including one produced by any other sequence unit) and a foreign
+        # object are rejected before the base validation runs.
+        if not isinstance(checkpoint, _GELUCheckpoint):
+            raise ValueError("restore requires a checkpoint returned by checkpoint()")
+
+        def fail():
+            raise ValueError("checkpoint is corrupted")
+
+        def need_pre_list(pres, record):
+            if record is None:
+                if pres is not None:
+                    fail()
+            else:
+                if not isinstance(pres, list) \
+                        or len(pres) != len(record["outputs"]):
+                    fail()
+                for value in pres:
+                    if isinstance(value, bool) \
+                            or not isinstance(value, (int, float)):
+                        fail()
+                    if not _is_finite(value):
+                        raise ValueError(
+                            "checkpoint contains a non-finite numeric value")
+
+        # Validate the GELU-only slots before anything is committed: each is
+        # present exactly when its trajectory is, with one finite z per
+        # recorded step. The trajectories themselves are validated by the
+        # base routine below, so a rejected checkpoint (including one with
+        # deleted/replaced attributes) always raises before touching state.
+        try:
+            need_pre_list(checkpoint._fwd_pres, checkpoint._fwd)
+            need_pre_list(checkpoint._stream_pres, checkpoint._stream)
+        except ValueError:
+            raise
+        except (AttributeError, TypeError):
+            raise ValueError("checkpoint is corrupted")
+
+        # The base routine performs the full structural and semantic
+        # validation of everything else and commits atomically; it rejects a
+        # checkpoint whose owner is another instance (the other GELUSequence
+        # included) and a width mismatch, in every case without changing
+        # state.
+        super().restore(checkpoint)
+
+        # Everything validated: commit independent copies of the pre lists.
+        self._fwd_pre = None if checkpoint._fwd_pres is None \
+            else list(checkpoint._fwd_pres)
+        self._stream_pre = None if checkpoint._stream_pres is None \
+            else list(checkpoint._stream_pres)
+        # Re-attach the open session's pre list so continued steps append to
+        # the restored trajectory rather than starting an empty record.
+        if self._stream is not None:
+            self._stream["_gelu_pre"] = self._stream_pre
+        return None
+
+    def export_state(self):
+        # Same plain-data object as the base export, with one extra aligned
+        # finite-number list per recorded trajectory ("pre"). An absent pass
+        # is represented by None, exactly like forward/stream.
+        state = super().export_state()
+        state["forward_pre"] = None if self._fwd_pre is None \
+            else list(self._fwd_pre)
+        state["stream_pre"] = None if self._stream_pre is None \
+            else list(self._stream_pre)
+        return state
+
+    def _parse_exported_state(self, state):
+        # Structural validation mirrors the base parser; the two extra
+        # pre-activation lists are the only additions and must be either
+        # None or lists (finite-domain and length checks happen in
+        # restore()), present exactly alongside their trajectory.
+        if not isinstance(state, dict):
+            raise ValueError(
+                "import_state requires a state produced by export_state()")
+        if set(state.keys()) != {"version", "kind", "width", "hidden",
+                                 "outputs", "forward", "stream", "linear",
+                                 "forward_pre", "stream_pre"}:
+            raise ValueError("state has an invalid structure")
+        base_state = {key: state[key] for key in
+                      ("version", "kind", "width", "hidden", "outputs",
+                       "forward", "stream", "linear")}
+        checkpoint = super()._parse_exported_state(base_state)
+        # super() built a plain _Checkpoint tied to this instance; promote
+        # it to a GELU checkpoint carrying the pre lists. convert=False: the
+        # base parser already turned boundary lists into sets.
+        gelu = _GELUCheckpoint(
+            owner_ref=checkpoint._owner_ref,
+            width=checkpoint._width,
+            hidden=checkpoint._hidden,
+            outputs=checkpoint._outputs,
+            fwd=checkpoint._fwd,
+            stream=checkpoint._stream,
+            linear_weight=checkpoint._linear_weight,
+            linear_bias=checkpoint._linear_bias,
+            linear_grad=checkpoint._linear_grad,
+            linear_grad_bias=checkpoint._linear_grad_bias,
+            linear_last=checkpoint._linear_last,
+            linear_last_weight=checkpoint._linear_last_weight,
+        )
+        for key in ("forward_pre", "stream_pre"):
+            value = state[key]
+            if value is not None and not isinstance(value, list):
+                raise ValueError("state has an invalid structure")
+        gelu._fwd_pres = state["forward_pre"]
+        gelu._stream_pres = state["stream_pre"]
+        return gelu
+
+    def import_state(self, state):
+        checkpoint = self._parse_exported_state(state)
+        return self.restore(checkpoint)
+
+    def step(self, row, segment_start=False):
+        # Reuse the base step machinery: it validates inputs, follows the
+        # boundary rules, calls self._activate (GELU) and commits
+        # atomically. Outside a session a successful standalone step
+        # invalidates the batch cache, so its pre-activations must be
+        # dropped in lockstep; nothing records pre values outside sessions.
+        if not isinstance(segment_start, bool):
+            raise ValueError("segment_start must be a boolean")
+        in_stream = self._stream is not None
+        result = super().step(row, segment_start)
+        if not in_stream:
+            # The base call cleared _fwd (and left _stream None).
+            self._fwd_pre = None
+            self._stream_pre = None
+        return result
+
+    def _stream_step(self, stream, values, segment_start):
+        # The base routine drives the session and calls self._activate; the
+        # pre-activation of this step is captured around the Linear forward
+        # via a GELU-private list carried on the stream record. The value is
+        # committed only on full success, mirroring the base rollback.
+        pre_list = stream.get("_gelu_pre")
+        if pre_list is None:
+            pre_list = []
+            stream["_gelu_pre"] = pre_list
+        i = len(stream["inputs"])
+        truncate = stream["truncate"]
+        truncate_boundary = truncate is not None and i % truncate == 0
+        is_boundary = truncate_boundary or segment_start
+        if is_boundary:
+            if i == 0:
+                hidden = stream["initial_hidden"]
+            elif stream["carry_hidden"]:
+                hidden = float(stream["outputs"][-1])
+            else:
+                hidden = 0.0
+        else:
+            hidden = self.hidden
+
+        # Same full-state snapshot as the base routine, extended with the
+        # pre-activation list, so a rejected step leaves no partial entry.
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+        saved_boundaries = set(stream["boundaries"])
+        saved_pre = list(pre_list)
+        try:
+            z = self.linear.forward(values + [hidden])
+            new_hidden = self._activate(z)
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            stream["boundaries"] = saved_boundaries
+            # Rebind every holder of the pre list to the rolled-back copy so
+            # the session record and self._stream_pre stay the same object.
+            stream["_gelu_pre"] = saved_pre
+            self._stream_pre = saved_pre
+            raise
+
+        if is_boundary:
+            stream["boundaries"].add(i)
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
+        stream["inputs"].append(values)
+        stream["prev_hiddens"].append(hidden)
+        stream["outputs"].append(new_hidden)
+        pre_list.append(z)
+        return new_hidden
+
+    def start_stream(self, initial_hidden=None, truncate=None,
+                     carry_hidden=False):
+        # Base validation and session opening; attach the aligned
+        # pre-activation list and clear any stale batch pre list.
+        super().start_stream(initial_hidden=initial_hidden, truncate=truncate,
+                             carry_hidden=carry_hidden)
+        self._fwd_pre = None
+        self._stream_pre = []
+        self._stream["_gelu_pre"] = self._stream_pre
+        return None
+
+    def finish_stream(self):
+        # The base routine commits the session into _fwd and returns the
+        # outputs; read the captured pre list (attached in start_stream)
+        # before it does and publish it alongside the new cache.
+        stream = self._stream
+        if stream is None:
+            raise RuntimeError(
+                "finish_stream requires an active session; call start_stream first")
+        pres = list(stream.get("_gelu_pre", ()))
+        outputs = super().finish_stream()
+        self._stream_pre = None
+        self._fwd_pre = pres
+        return outputs
+
+    def forward(self, rows, truncate=None, carry_hidden=False,
+                initial_hidden=None, segment_starts=None):
+        # Drive a GELU traversal explicitly so each step's finite
+        # pre-activation is recorded, while reusing the base class's
+        # argument validation, boundary rules and atomicity. The base
+        # forward is not used because it has no hook for capturing z.
+        if truncate is not None:
+            if isinstance(truncate, bool) or not isinstance(truncate, int) \
+                    or truncate <= 0:
+                raise ValueError("truncate must be a positive integer or None")
+        if not isinstance(carry_hidden, bool):
+            raise ValueError("carry_hidden must be a boolean")
+        if initial_hidden is None:
+            initial_hidden = 0.0
+        else:
+            initial_hidden = _read_number(initial_hidden, "initial_hidden")
+        if segment_starts is not None:
+            segment_flags = _read_bool_sequence(segment_starts,
+                                                "segment_starts")
+            try:
+                n_rows = len(rows)
+            except TypeError:
+                raise ValueError(
+                    "segment_starts requires a sized rows sequence")
+            if len(segment_flags) != n_rows:
+                raise ValueError(
+                    "segment_starts length %d does not match rows length %d"
+                    % (len(segment_flags), n_rows))
+        else:
+            segment_flags = None
+
+        validated_rows = [_read_row(row, self.d) for row in rows]
+
+        saved_hidden = self.hidden
+        saved_outputs = self.outputs
+        saved_fwd = self._fwd
+        saved_stream = self._stream
+        saved_fwd_pre = self._fwd_pre
+        saved_stream_pre = self._stream_pre
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        saved_grad = list(self.linear.grad)
+        saved_grad_bias = self.linear.grad_bias
+
+        inputs = []
+        prev_hiddens = []
+        outputs = []
+        pres = []
+        boundaries = set()
+        weights = list(self.linear.weight)
+
+        hidden = initial_hidden
+        try:
+            for i, x in enumerate(validated_rows):
+                declared = segment_flags is not None and segment_flags[i]
+                if (truncate is not None and i % truncate == 0) or declared:
+                    if i > 0 and carry_hidden:
+                        hidden = outputs[-1]
+                    elif i > 0:
+                        hidden = 0.0
+                    else:
+                        hidden = initial_hidden
+                    boundaries.add(i)
+                prev_hiddens.append(hidden)
+                # Linear.forward rejects a non-finite z before caching
+                # anything, and GELU of a finite z is always finite.
+                z = self.linear.forward(x + [hidden])
+                hidden = self._activate(z)
+                inputs.append(x)
+                outputs.append(hidden)
+                pres.append(z)
+        except (TypeError, ValueError):
+            self.hidden = saved_hidden
+            self.outputs = saved_outputs
+            self._fwd = saved_fwd
+            self._stream = saved_stream
+            self._fwd_pre = saved_fwd_pre
+            self._stream_pre = saved_stream_pre
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            self.linear.grad = saved_grad
+            self.linear.grad_bias = saved_grad_bias
+            raise
+
+        self.hidden = hidden
+        self.outputs = list(outputs)
+        self._stream = None
+        self._stream_pre = None
+        self._fwd = {
+            "inputs": inputs,
+            "prev_hiddens": prev_hiddens,
+            "outputs": list(outputs),
+            "boundaries": boundaries,
+            "truncate": truncate,
+            "carry_hidden": carry_hidden,
+            "weights": weights,
+        }
+        self._fwd_pre = pres
+        return list(outputs)
+
+    def _backward(self, grad_outputs, grad_hidden, return_initial,
+                  return_boundaries=False):
+        # Same BPTT as the base unit, except the local derivative is taken
+        # at the recorded pre-activation z rather than inferred from the
+        # cached output. All validation, truncation cuts, parameter-gradient
+        # accumulation, return shapes and the compute-into-locals atomicity
+        # are identical to the base routine.
+        if self._stream is not None:
+            raise RuntimeError(
+                "backward requires the stream session to be finished first")
+        if self._fwd is None or self._fwd_pre is None:
+            raise RuntimeError("backward requires a cached forward pass; call forward first")
+
+        inputs = self._fwd["inputs"]
+        prev_hiddens = self._fwd["prev_hiddens"]
+        outputs = self._fwd["outputs"]
+        boundaries = self._fwd["boundaries"]
+        weights = self._fwd["weights"]
+        pres = self._fwd_pre
+        d = len(weights) - 1
+        w_inputs = weights[:d]
+        w_hidden = weights[d]
+        n = len(outputs)
+        grad_outputs = _read_grad_list(grad_outputs, n)
+        grad_hidden = _read_number(grad_hidden, "grad_hidden")
+        if len(pres) != n:
+            # Defensive: forward/checkpoint always keep these aligned.
+            raise ValueError("cached forward pass is corrupted")
+
+        param_grad = list(self.linear.grad)
+        param_grad_bias = self.linear.grad_bias
+
+        input_grads = [0.0] * n
+        boundary_grads = []
+
+        hidden_grad = float(grad_hidden)
+        grad_initial_hidden = grad_hidden if n == 0 else 0.0
+        try:
+            for t in range(n - 1, -1, -1):
+                dh = grad_outputs[t] + hidden_grad
+                d_pre = dh * self._activation_derivative(pres[t])
+
+                row = inputs[t]
+                for k in range(d):
+                    param_grad[k] += d_pre * row[k]
+                param_grad[d] += d_pre * prev_hiddens[t]
+                param_grad_bias += d_pre
+
+                row_grads = [d_pre * w for w in w_inputs]
+                input_grads[t] = row_grads[0] if d == 1 else row_grads
+                if t == 0:
+                    grad_initial_hidden = d_pre * w_hidden
+                if t in boundaries:
+                    if return_boundaries and t > 0:
+                        boundary_grads.append((t, d_pre * w_hidden))
+                    hidden_grad = 0.0
+                else:
+                    hidden_grad = d_pre * w_hidden
+        except OverflowError:
+            raise ValueError("backward result must be finite")
+
+        def _check(value):
+            _require_finite(value, "gradient")
+
+        for value in param_grad:
+            _check(value)
+        _check(param_grad_bias)
+        _check(grad_initial_hidden)
+        for value in input_grads:
+            if isinstance(value, list):
+                for item in value:
+                    _check(item)
+            else:
+                _check(value)
+        for _, value in boundary_grads:
+            _check(value)
+
+        self.linear.grad = param_grad
+        self.linear.grad_bias = param_grad_bias
+
+        if return_boundaries:
+            boundary_grads.reverse()
+            return input_grads, grad_initial_hidden, boundary_grads
+        if return_initial:
+            return input_grads, grad_initial_hidden
+        return input_grads
