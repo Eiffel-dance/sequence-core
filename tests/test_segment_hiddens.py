@@ -5,7 +5,8 @@ import math
 import unittest
 
 from app import (ELUSequence, GELUSequence, LeakyReLUSequence, Linear,
-                 ReLUSequence, SigmoidSequence, SoftplusSequence, TanhSequence)
+                 ReLUSequence, SigmoidSequence, SiLUSequence,
+                 SoftplusSequence, TanhSequence)
 
 INF = float("inf")
 NAN = float("nan")
@@ -16,7 +17,7 @@ ROWS = [[0.8], [-0.5], [1.2], [-0.7], [0.3]]
 GO = [0.3, -0.6, 0.9, -0.2, 0.5]
 
 ALL_CLASSES = (TanhSequence, SigmoidSequence, SoftplusSequence, ReLUSequence,
-               LeakyReLUSequence, ELUSequence, GELUSequence)
+               LeakyReLUSequence, ELUSequence, GELUSequence, SiLUSequence)
 
 
 def expect_value_error(fn):

@@ -1538,6 +1538,10 @@ class GELUSequence(TanhSequence):
     """
 
     _STATE_KIND = "GELUSequenceState"
+    # Checkpoint type produced by checkpoint() and accepted by restore().
+    # A subclass that reuses the pre-activation record layout substitutes
+    # its own checkpoint type, so foreign checkpoints stay rejected.
+    _CHECKPOINT_CLASS = _GELUCheckpoint
 
     @staticmethod
     def _activate(z):
@@ -1957,7 +1961,7 @@ class GELUSequence(TanhSequence):
                 "segment_hiddens": list(stream["segment_hiddens"]),
             }
             pres_stream = list(stream["pres"])
-        return _GELUCheckpoint(
+        return self._CHECKPOINT_CLASS(
             owner_ref=weakref.ref(self),
             width=self.d + 1,
             hidden=self.hidden,
@@ -1983,7 +1987,7 @@ class GELUSequence(TanhSequence):
         # foreign-owned, width-incompatible or non-finite) raises ValueError
         # before anything is touched, so the instance is left exactly as it
         # was.
-        if not isinstance(checkpoint, _GELUCheckpoint):
+        if not isinstance(checkpoint, self._CHECKPOINT_CLASS):
             raise ValueError("restore requires a checkpoint returned by checkpoint()")
 
         def fail():
@@ -2143,7 +2147,7 @@ class GELUSequence(TanhSequence):
 
         fwd_record, pres_fwd = parse_trajectory(state["forward"], False)
         stream_record, pres_stream = parse_trajectory(state["stream"], True)
-        return _GELUCheckpoint(
+        return self._CHECKPOINT_CLASS(
             owner_ref=weakref.ref(self),
             width=width,
             hidden=state["hidden"],
@@ -2159,3 +2163,74 @@ class GELUSequence(TanhSequence):
             pres_fwd=pres_fwd,
             pres_stream=pres_stream,
         )
+
+
+class _SiLUCheckpoint(_GELUCheckpoint):
+    # SiLUSequence checkpoint: the same slots as the GELU one (the per-step
+    # pre-activations travel in the same dedicated slots), but a distinct
+    # type so a GELUSequence checkpoint is never accepted by a
+    # SiLUSequence, nor a SiLUSequence checkpoint by a GELUSequence.
+    __slots__ = ()
+
+
+class SiLUSequence(GELUSequence):
+    """SiLU (sigmoid linear unit, swish) counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is silu(z) = z * sigmoid(z), with sigmoid evaluated as
+    exp(z) / (1 + exp(z)) for negative z and 1 / (1 + exp(-z)) otherwise,
+    so the exponential's argument is never positive and no finite
+    pre-activation can overflow it; z == 0 yields the exact zero constant.
+    The local derivative carried through backward is
+    sigmoid(z) * (1 + z * (1 - sigmoid(z))), which cannot be recovered
+    reliably from the cached output, so each trajectory record stores the
+    per-step pre-activations ("pres") exactly like GELUSequence; they
+    travel inside checkpoints and exported states (as "pre_activations")
+    under the same validation, copying and atomicity rules as every other
+    recorded datum. Exported states carry a distinct kind tag
+    ("SiLUSequenceState"), so a state of any other sequence class never
+    migrates into a SiLUSequence (or vice versa); the version rule is
+    unchanged.
+    """
+
+    _STATE_KIND = "SiLUSequenceState"
+    _CHECKPOINT_CLASS = _SiLUCheckpoint
+
+    @staticmethod
+    def _activate(z):
+        # z * sigmoid(z). The pre-activation is already validated finite by
+        # Linear.forward. Both sigmoid branches keep the exponential's
+        # argument non-positive, so it can at worst underflow to zero: a
+        # huge positive z saturates sigmoid to exactly 1.0 and the output
+        # to z itself, a huge negative z to exactly 0.0 and the output to
+        # a signed zero. |sigmoid| <= 1, so the product's magnitude never
+        # exceeds |z| and every finite input yields a finite output.
+        if z < 0:
+            ez = math.exp(z)
+            return z * (ez / (1.0 + ez))
+        return z * (1.0 / (1.0 + math.exp(-z)))
+
+    @staticmethod
+    def _activation_derivative(z):
+        # Local derivative of the activation, expressed in the cached
+        # pre-activation z (the cached output alone cannot determine it):
+        #   sigmoid(z) * (1 + z * (1 - sigmoid(z))).
+        # Converting to float first keeps huge finite ints from raising
+        # OverflowError in the products. The sigmoid branches keep the
+        # exponential's argument non-positive, and z * (1 - sigmoid(z)) is
+        # bounded by |z| for negative z and by z * exp(-z) (<= 1/e) for
+        # positive z, so every finite z yields a finite derivative: a huge
+        # positive z saturates to exactly 1.0, a huge negative z to a
+        # signed zero.
+        z = float(z)
+        if z < 0:
+            ez = math.exp(z)
+            sig = ez / (1.0 + ez)
+        else:
+            sig = 1.0 / (1.0 + math.exp(-z))
+        return sig * (1.0 + z * (1.0 - sig))
