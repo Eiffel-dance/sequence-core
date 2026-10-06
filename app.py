@@ -4963,3 +4963,67 @@ class HardSwishSequence(TanhSequence):
             pres_fwd=pres_fwd,
             pres_stream=pres_stream,
         )
+
+class HardSigmoidSequence(TanhSequence):
+    """Hard-sigmoid counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias, and
+    the fixed piecewise hard-sigmoid activation is
+
+        z <= -2.5  : exactly 0.0
+        -2.5 < z < 2.5: z / 5 + 0.5
+        z >= 2.5   : exactly 1.0
+
+    with the local derivative
+
+        z <= -2.5  : exactly 0.0
+        -2.5 < z < 2.5: 0.2
+        z >= 2.5   : exactly 0.0
+
+    (both endpoints belong to the saturated branches). The middle branch
+    only ever evaluates for |z| < 2.5, so every finite pre-activation
+    (already validated by Linear.forward) yields a finite output in
+    [0, 1] with no overflow path, and the cached output alone decides the
+    branch: the middle branch produces values strictly inside (0, 1),
+    while the saturated branches produce exactly 0.0 and exactly 1.0.
+    There are no configurable slopes or thresholds: the constructor takes
+    only the Linear, exactly like the other sequence classes. Exported
+    states carry a distinct kind tag ("HardSigmoidSequenceState"), so a
+    state of any other sequence class never migrates into a
+    HardSigmoidSequence (or vice versa); the version rule is unchanged.
+    """
+
+    _STATE_KIND = "HardSigmoidSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # Fixed piecewise hard sigmoid with the endpoints pinned to the
+        # saturated branches: the exact zero constant 0.0 at and below
+        # -2.5, the exact one constant 1.0 at and above 2.5, and
+        # z/5 + 0.5 strictly between. The middle branch only ever
+        # evaluates for |z| < 2.5, where the division and the addition
+        # cannot overflow, so every finite input (already validated by
+        # Linear.forward) yields a finite output in [0, 1].
+        if z <= -2.5:
+            return 0.0
+        if z >= 2.5:
+            return 1.0
+        return z / 5 + 0.5
+
+    @staticmethod
+    def _activation_derivative(output):
+        # Local derivative of the activation, expressed in the cached
+        # output. The saturated branches produce exactly 0.0 and exactly
+        # 1.0, and the middle branch z/5 + 0.5 with |z| < 2.5 produces
+        # values strictly inside (0, 1) (the sum cannot round to an
+        # endpoint), so the cached output alone decides the branch:
+        # derivative 0.0 at the two saturated outputs, the fixed slope
+        # 0.2 everywhere between.
+        if output <= 0.0 or output >= 1.0:
+            return 0.0
+        return 0.2
