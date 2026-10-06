@@ -1496,6 +1496,124 @@ class ELUSequence(TanhSequence):
         return 1.0 if output > 0 else 1.0 + output
 
 
+# Fixed SELU (scaled exponential linear unit) constants, computed once.
+_SELU_ALPHA = 1.6732632423543772
+_SELU_SCALE = 1.0507009873554805
+_SELU_SCALE_ALPHA = _SELU_SCALE * _SELU_ALPHA
+
+
+class SELUSequence(TanhSequence):
+    """SELU (scaled exponential linear unit) counterpart of TanhSequence.
+
+    Same Linear weight layout (the first d weights pair with the d input
+    features, the last with the recurrent hidden state, the Linear bias is
+    reused) and the same forward/step/start_stream/finish_stream/backward/
+    backward_with_initial_hidden/backward_with_boundaries, checkpoint/restore
+    and export_state/import_state interface. The pre-activation z is the
+    input weighted sum plus the recurrent hidden term plus the bias; the
+    output is selu(z) with the fixed constants alpha = 1.6732632423543772
+    and scale = 1.0507009873554805 — exactly scale * z for z > 0, the
+    exact zero constant 0.0 for z == 0, and scale * alpha * expm1(z) for
+    z < 0 — and the local derivative carried through backward is scale
+    where z > 0 and scale * alpha * exp(z) where z <= 0, so the zero
+    pre-activation has the single documented slope scale * alpha. The
+    negative branch only ever evaluates expm1() at a strictly negative
+    finite argument, so it can at worst underflow: a hugely negative z
+    saturates to exactly -scale * alpha with no overflow path. The
+    positive branch multiplies by scale > 1, so a huge finite z can
+    overflow the double range; that overflow is rejected with a ValueError
+    before any state is committed, exactly like a Linear overflow. alpha
+    and scale are not configurable: the constructor takes only the Linear,
+    exactly like the other sequence classes. Exported states carry a
+    distinct kind tag ("SELUSequenceState"), so a state of any other
+    sequence class never migrates into a SELUSequence (or vice versa);
+    the version rule is unchanged.
+    """
+
+    _STATE_KIND = "SELUSequenceState"
+
+    @staticmethod
+    def _activate(z):
+        # The pre-activation is already validated finite by Linear.forward.
+        # For z < 0 the exponential's argument is strictly negative, so it
+        # can at worst underflow to zero: scale * alpha * expm1(z) stays
+        # finite and tends to exactly -scale * alpha for a hugely negative
+        # z, with no overflow path. z == 0 (including -0.0) returns the
+        # exact positive zero constant rather than a signed product. For
+        # z > 0 the product scale * z can overflow the double range (scale
+        # exceeds 1); that is rejected before the result is committed
+        # anywhere, mirroring the Linear output rule.
+        if z > 0:
+            try:
+                result = _SELU_SCALE * z
+            except OverflowError:
+                raise ValueError("selu output must be finite")
+            _require_finite(result, "selu output")
+            return result
+        if z == 0:
+            return 0.0
+        return _SELU_SCALE_ALPHA * math.expm1(z)
+
+    @staticmethod
+    def _activation_derivative(output):
+        # The cached output equals scale * z (strictly positive) wherever
+        # z > 0, is exactly 0.0 at z == 0 and equals
+        # scale * alpha * expm1(z) (in [-scale * alpha, 0)) wherever
+        # z < 0, so it alone decides the branch: derivative scale at a
+        # positive pre-activation, and scale * alpha * exp(z)
+        # = scale * alpha + output at z <= 0. At z == 0 this is exactly
+        # scale * alpha (the zero point's single documented slope), and in
+        # the saturated limit output == -scale * alpha it is exactly 0.0.
+        if output > 0:
+            return _SELU_SCALE
+        return _SELU_SCALE_ALPHA + output
+
+    def step(self, row, segment_start=False, segment_hidden=None):
+        # Same validation, boundary and commit rules as the base step. The
+        # SELU activation is the only one whose positive branch can reject
+        # an already validated finite pre-activation (a huge z whose scaled
+        # output overflows), and by then Linear.forward has already
+        # recorded its cache — so the Linear's forward record is rolled
+        # back when the activation fails, keeping the whole object exactly
+        # as it was before the rejected call.
+        if not isinstance(segment_start, bool):
+            raise ValueError("segment_start must be a boolean")
+        if segment_hidden is not None:
+            segment_hidden = _read_number(segment_hidden, "segment_hidden")
+        values = _read_row(row, self.d)
+        stream = self._stream
+        if stream is not None:
+            return self._stream_step(stream, values, segment_start,
+                                     segment_hidden)
+        if segment_start:
+            # Explicit boundary marks are only meaningful inside a session;
+            # outside one there is no recorded trajectory to cut.
+            raise RuntimeError(
+                "segment_start=True requires an active stream session; "
+                "call start_stream first")
+        if segment_hidden is not None:
+            raise RuntimeError(
+                "segment_hidden requires an active stream session; "
+                "call start_stream first")
+        # Compute into a local first; only commit once the Linear forward
+        # and the activation succeeded. A rejected activation restores the
+        # Linear's forward record, so the failed call changes nothing.
+        saved_last = self.linear.last
+        saved_last_weight = self.linear._last_weight
+        try:
+            new_hidden = self._activate(self.linear.forward(values + [self.hidden]))
+        except (TypeError, ValueError):
+            self.linear.last = saved_last
+            self.linear._last_weight = saved_last_weight
+            raise
+        self.hidden = new_hidden
+        self.outputs.append(new_hidden)
+        # Continuing the trajectory stepwise mixes it with any recorded batch
+        # pass, so that cache can no longer be back-propagated safely.
+        self._fwd = None
+        return new_hidden
+
+
 # Constants of the exact (error-function) GELU formulation, computed once.
 _GELU_SQRT2 = math.sqrt(2.0)
 _GELU_SQRT_2PI = math.sqrt(2.0 * math.pi)
